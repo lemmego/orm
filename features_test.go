@@ -2,10 +2,12 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- query logging --------------------------------------------------------
@@ -330,5 +332,90 @@ func TestSavepointNameIsValidated(t *testing.T) {
 		if err := CheckIdentifier(name); err != nil {
 			t.Fatalf("expected %q to be accepted: %v", name, err)
 		}
+	}
+}
+
+// A timestamp column whose declared type the driver does not recognise comes
+// back as text. SQLite does this for "DATETIME(6)" — which is exactly what the
+// migration builder emits — and for "TEXT", so a model using time.Time could
+// not read its own rows back.
+func TestTimestampsScanFromAnyDeclaredType(t *testing.T) {
+	type Stamped struct {
+		ID        int `orm:"primaryKey;autoIncrement"`
+		CreatedAt time.Time
+		DeletedAt *time.Time
+		Noted     sql.NullTime
+	}
+
+	for _, declared := range []string{"DATETIME", "DATETIME(6)", "TIMESTAMP", "TEXT", "VARCHAR(64)"} {
+		t.Run(declared, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := context.Background()
+			if _, err := db.Exec(ctx, `CREATE TABLE stampeds (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				created_at `+declared+`,
+				deleted_at `+declared+`,
+				noted `+declared+`)`); err != nil {
+				t.Fatal(err)
+			}
+
+			when := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+			row := &Stamped{CreatedAt: when, Noted: sql.NullTime{Time: when, Valid: true}}
+			if _, err := db.Model[Stamped]().Create(ctx, row); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			found, err := db.Model[Stamped]().Find(ctx, row.ID)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if !found.CreatedAt.Equal(when) {
+				t.Fatalf("got %s, want %s", found.CreatedAt, when)
+			}
+			// A NULL timestamp must still land as the zero value.
+			if found.DeletedAt != nil {
+				t.Fatalf("expected nil for a NULL column, got %v", found.DeletedAt)
+			}
+			if !found.Noted.Valid || !found.Noted.Time.Equal(when) {
+				t.Fatalf("NullTime did not round-trip: %#v", found.Noted)
+			}
+		})
+	}
+}
+
+// Soft deletes rely on reading the marker back, so they must survive the same
+// treatment.
+func TestSoftDeleteWithTextTimestampColumn(t *testing.T) {
+	type Doc struct {
+		ID        int `orm:"primaryKey;autoIncrement"`
+		Title     string
+		DeletedAt *time.Time
+	}
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `CREATE TABLE docs (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, deleted_at DATETIME(6))`); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := &Doc{Title: "draft"}
+	if _, err := db.Model[Doc]().Create(ctx, doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Model[Doc]().Delete(ctx, doc); err != nil {
+		t.Fatal(err)
+	}
+	visible, err := db.Model[Doc]().Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visible != 0 {
+		t.Fatalf("expected the row hidden, got %d", visible)
+	}
+	trashed, err := db.Model[Doc]().OnlyTrashed().All(ctx)
+	if err != nil {
+		t.Fatalf("reading trashed rows: %v", err)
+	}
+	if len(trashed) != 1 || trashed[0].DeletedAt == nil {
+		t.Fatalf("expected one trashed row with a marker: %#v", trashed)
 	}
 }

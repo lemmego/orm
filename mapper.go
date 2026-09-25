@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 )
 
 // discard swallows a column the destination does not map.
@@ -104,6 +106,15 @@ func buildDestinations(value reflect.Value, info *ModelInfo, columns []string, s
 // own conversion and leaves the field zero when the column is NULL, without
 // forcing every nullable column to be declared as a pointer.
 func scanDestination(field reflect.Value) (any, func()) {
+	// Timestamps come back in whatever shape the driver chose. SQLite returns
+	// a string unless the column's declared type is one the driver
+	// recognises, so "DATETIME(6)" or "TEXT" yields text where "DATETIME"
+	// yields time.Time. Route every time field through a scanner that accepts
+	// both, rather than failing on a perfectly ordinary schema.
+	if isTimeLike(field.Type()) {
+		return timeScanner{target: field}, nil
+	}
+
 	addr := field.Addr()
 	if field.Kind() == reflect.Pointer || addr.Type().Implements(scannerType) {
 		return addr.Interface(), nil
@@ -164,4 +175,55 @@ func fieldByIndex(value reflect.Value, index []int) (reflect.Value, error) {
 		return reflect.Value{}, fmt.Errorf("orm: field is not settable")
 	}
 	return value, nil
+}
+
+// timeLayouts are tried in order against a textual timestamp. The first two
+// cover SQLite's own output; the rest cover the spellings drivers and hand
+// written schemas commonly produce.
+var timeLayouts = []string{
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999",
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02",
+	"15:04:05",
+}
+
+// timeScanner reads a timestamp column into a time.Time, *time.Time or
+// sql.NullTime field, whatever concrete shape the driver hands over.
+type timeScanner struct{ target reflect.Value }
+
+func (s timeScanner) Scan(src any) error {
+	switch value := src.(type) {
+	case nil:
+		s.target.SetZero()
+		return nil
+	case time.Time:
+		return setTime(s.target, value)
+	case string:
+		return s.parse(value)
+	case []byte:
+		return s.parse(string(value))
+	case int64:
+		// Unix seconds, which is how some schemas store timestamps.
+		return setTime(s.target, time.Unix(value, 0).UTC())
+	}
+	return fmt.Errorf("orm: cannot read %T into %s", src, s.target.Type())
+}
+
+func (s timeScanner) parse(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		s.target.SetZero()
+		return nil
+	}
+	for _, layout := range timeLayouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return setTime(s.target, parsed)
+		}
+	}
+	return fmt.Errorf("orm: cannot parse %q as a timestamp for %s", value, s.target.Type())
 }
