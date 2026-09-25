@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -417,5 +418,71 @@ func TestSoftDeleteWithTextTimestampColumn(t *testing.T) {
 	}
 	if len(trashed) != 1 || trashed[0].DeletedAt == nil {
 		t.Fatalf("expected one trashed row with a marker: %#v", trashed)
+	}
+}
+
+// A soft-deleted row is hidden from direct queries, so it must be hidden from
+// relations too. It previously still appeared through a parent's eager load,
+// which meant "deleted" depended on how you reached the row.
+func TestSoftDeletedChildrenAreNotEagerLoaded(t *testing.T) {
+	type Chapter struct {
+		ID        int `orm:"primaryKey;autoIncrement"`
+		BookID    int
+		Title     string
+		DeletedAt *time.Time
+	}
+	type Book struct {
+		ID       int `orm:"primaryKey;autoIncrement"`
+		Name     string
+		Chapters []Chapter `orm:"hasMany:BookID"`
+	}
+
+	db, ctx := openTestDB(t), context.Background()
+	if _, err := db.Exec(ctx, `CREATE TABLE books (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+		CREATE TABLE chapters (id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER, title TEXT, deleted_at DATETIME)`); err != nil {
+		t.Fatal(err)
+	}
+
+	book := &Book{Name: "A Book"}
+	if _, err := db.Model[Book]().Create(ctx, book); err != nil {
+		t.Fatal(err)
+	}
+	var doomed *Chapter
+	for i := range 3 {
+		chapter := &Chapter{BookID: book.ID, Title: fmt.Sprintf("Chapter %d", i)}
+		if _, err := db.Model[Chapter]().Create(ctx, chapter); err != nil {
+			t.Fatal(err)
+		}
+		doomed = chapter
+	}
+
+	if _, err := db.Model[Chapter]().Delete(ctx, doomed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct query hides it.
+	direct, err := db.Model[Chapter]().Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct != 2 {
+		t.Fatalf("expected 2 visible chapters, got %d", direct)
+	}
+
+	// The relation must agree.
+	loaded, err := db.Model[Book]().With("Chapters").All(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 book, got %d", len(loaded))
+	}
+	if len(loaded[0].Chapters) != 2 {
+		t.Fatalf("a soft-deleted chapter must not be eager-loaded, got %d", len(loaded[0].Chapters))
+	}
+	for _, chapter := range loaded[0].Chapters {
+		if chapter.ID == doomed.ID {
+			t.Fatal("the deleted chapter came back through the relation")
+		}
 	}
 }

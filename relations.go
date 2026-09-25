@@ -207,6 +207,13 @@ func fetchByKeys(ctx context.Context, exec executor, dialect Dialect, info *Mode
 			" WHERE " + dialect.Quote(field.Column) +
 			" IN (" + strings.Join(placeholders, ", ") + ")"
 
+		// A soft-deleted row is hidden from direct queries, so it must be
+		// hidden from relations too. Without this a deleted child still
+		// appeared through its parent's eager load.
+		if info.SoftDelete != nil {
+			query += " AND " + dialect.Quote(info.SoftDelete.Column) + " IS NULL"
+		}
+
 		rows, err := exec.QueryContext(ctx, query, chunk...)
 		if err != nil {
 			return reflect.Value{}, dialect.ClassifyError(err)
