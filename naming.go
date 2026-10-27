@@ -1,9 +1,9 @@
 package orm
 
 // The naming and tag rules are exported so that code generators produce
-// descriptors identical to what the runtime resolves. Keeping one
-// implementation is deliberate: a second, slightly different copy is what
-// previously let the ORM look for "categorys" while the migration created
+// descriptors identical to what the runtime resolves. Call these rather than
+// reimplementing them: a second copy that pluralises even slightly
+// differently has the ORM querying "categorys" while the migration created
 // "categories".
 
 // ColumnName returns the column a struct field maps to by default.
