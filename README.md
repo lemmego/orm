@@ -12,8 +12,8 @@ db := orm.Open(sqlDB, orm.Postgres())
 ```
 
 is the whole setup. Two optional modules build on it, and neither is required:
-[`gpaorm`](../gpaorm) exposes it through the GPA contracts, and
-[`ormconnector`](../ormconnector) wires it into the application lifecycle. The
+[`gpaorm`](https://github.com/lemmego/gpaorm) exposes it through the GPA contracts, and
+[`ormconnector`](https://github.com/lemmego/ormconnector) wires it into the application lifecycle. The
 dependency direction is one-way — they import the ORM, never the reverse.
 
 ## Quick start
@@ -96,7 +96,7 @@ generates them:
 go run github.com/lemmego/orm/cmd/ormgen ./internal/models
 ```
 
-An application using [`ormconnector`](../ormconnector) gets the same generator
+An application using [`ormconnector`](https://github.com/lemmego/ormconnector) gets the same generator
 as an `orm:fields` CLI command. The generator logic lives in the importable
 `ormgen` package, so `go/ast` is not pulled in by importing the ORM itself.
 
@@ -310,8 +310,8 @@ err := db.Transaction(ctx, func(tx *orm.Tx) error {
 })
 ```
 
-A transaction is deliberately not bound to one entity type, so a single unit of
-work spans as many models as it needs. `AfterCommit` registers callbacks that
+A transaction is not bound to one entity type, so a single unit of work spans
+as many models as it needs. `AfterCommit` registers callbacks that
 run only once the commit succeeds and cannot roll it back.
 
 Savepoint names are written into the SQL text rather than bound as parameters,
@@ -400,7 +400,7 @@ Sentinels: `ErrNotFound`, `ErrClosed`, `ErrUnsafeMutation`, `ErrUnsupported`,
 
 ## GPA
 
-The [`gpaorm`](../gpaorm) module implements the GPA persistence contracts on
+The [`gpaorm`](https://github.com/lemmego/gpaorm) module implements the GPA persistence contracts on
 top of this ORM, so an application written against `gpa.Repository[T]` can run
 on it. It is entirely optional: the ORM never imports GPA, and everything above
 works without it.
