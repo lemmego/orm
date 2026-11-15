@@ -311,13 +311,87 @@ err := db.Transaction(ctx, func(tx *orm.Tx) error {
 ```
 
 A transaction is not bound to one entity type, so a single unit of work spans
-as many models as it needs. `AfterCommit` registers callbacks that
-run only once the commit succeeds and cannot roll it back.
+as many models as it needs. `AfterCommit` registers callbacks that run only
+once the commit succeeds and cannot roll it back.
+
+Every registered callback runs, and their errors are joined rather than the
+first one returned — stopping at the first would silently skip work that was
+registered precisely because it has to happen after the commit. A failure
+there is wrapped in `ErrAfterCommit`, so a caller can tell it from a commit
+failure:
+
+```go
+if err := tx.CommitContext(ctx); err != nil {
+    if errors.Is(err, orm.ErrAfterCommit) {
+        // The transaction committed. Repair or report the callback —
+        // never replay the unit of work, which would apply it twice.
+    }
+}
+```
 
 Savepoint names are written into the SQL text rather than bound as parameters,
 so they are validated as plain identifiers; anything else returns
 `ErrInvalidIdentifier`. `CheckIdentifier` is exported for callers that build
 names themselves.
+
+## Observing writes
+
+`db.Observe` registers a process-wide observer, called after a successful
+write. It is how a search index, a cache or a feed stays in step with the
+database without every call site remembering to tell it.
+
+```go
+db.Observe(func(ctx context.Context, change orm.Change) {
+    post, ok := change.Entity.(*Post)
+    if !ok {
+        return
+    }
+    switch change.Op {
+    case orm.ChangeDelete:
+        _ = search.Forget(ctx, engine, post)
+    default:
+        _ = search.Sync(ctx, engine, post)
+    }
+})
+```
+
+**Inside a transaction it fires after the commit**, and that is the whole
+value. GORM's callbacks and Bun's query hooks both fire *inside* the
+transaction: a change announced there is announced before the row is visible
+to anything else, so a subscriber that refetches finds nothing — and if the
+transaction then rolls back, something has been told about a row that does not
+exist. A change raised through `db.Model[T]()` fires immediately; one raised
+through `tx.Model[T]()` is held until `CommitContext` succeeds and discarded
+by `Rollback`. Nothing the caller writes makes the difference; the handle
+does.
+
+`Observe` is a method on `*DB` and not a package-level registry, which is not
+stylistic: a global registry fires for every handle in the process and cannot
+be cleaned up between test cases, so one case's observer satisfies the next
+case's assertion.
+
+What an observer must not be:
+
+- **The place a counter is incremented.** Two concurrent observers both read
+  41 and both write 42, and the lost vote is silent and permanent. That is
+  what a database trigger or `SET c = c + 1` is for.
+- **Somewhere to do slow work.** An observer on `*DB` runs on the goroutine
+  that did the write, so anything expensive is paid by the request. Hand off
+  to a queue.
+
+A panicking observer does not take the write down — each runs under
+`recover()` — and the panic is logged rather than swallowed.
+
+A soft delete is reported as `ChangeDelete` even though the statement is an
+`UPDATE`: what it means downstream is that the row is gone, and an observer
+told "updated" would reindex a row it should remove. `Restore` is reported as
+`ChangeUpdate`.
+
+**`UpdateAll` and `DeleteAll` observe nothing.** There is no entity to
+announce, and the matched set is unknown without a `RETURNING` or a prior
+`SELECT` that changes the statement's cost and its lock footprint. A loud
+nothing beats a surprise query, so the limitation is pinned by a test: a bulk
+mutation is reconciled by a reimport, not by this.
 
 ## Query logging
 
@@ -434,7 +508,13 @@ rather than guessing.
 ## Not implemented yet
 
 Row locking and subqueries; the GPA adapter reports both as unsupported rather
-than ignoring them.
+than ignoring them. Keyset pagination, an atomic increment in `UpdateAll`
+(`col = col + 1` is inexpressible, since every value is bound as a
+placeholder), and ordered or limited eager loading.
+
+`Observe` does not report the *old* value of a changed row, so "what became
+false" is not answerable from it. An observer that needs that reads the row
+before the write.
 
 ## Verification
 

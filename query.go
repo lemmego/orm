@@ -49,6 +49,16 @@ type Query[T any] struct {
 	withTrashed      bool
 	onlyTrashed      bool
 
+	// changeSink is where a successful write announces itself, or nil when
+	// nothing is listening. Carried by clone() and As[R] along with
+	// everything else, so a filtered or reprojected query is observed too.
+	//
+	// It is a field rather than something recovered from executor because
+	// executor is the standard library's *sql.DB or *sql.Tx — satisfied by
+	// those types and not by orm.Tx — so there is nothing on a query to
+	// reach the owning transaction through. See DB.Observe.
+	changeSink changeSink
+
 	// err defers a construction failure (an unmappable model, say) to the
 	// point of execution, so the builder chain stays free of error returns.
 	err error
@@ -218,6 +228,7 @@ func (q *Query[T]) As[R any]() *Query[R] {
 		softDeleteColumn: q.softDeleteColumn,
 		withTrashed:      q.withTrashed,
 		onlyTrashed:      q.onlyTrashed,
+		changeSink:       q.changeSink,
 		err:              q.err,
 	}
 }
@@ -620,6 +631,7 @@ func (q *Query[T]) Create(ctx context.Context, entity *T) (sql.Result, error) {
 	if err := runAfterCreate(ctx, entity); err != nil {
 		return nil, err
 	}
+	q.observe(ctx, ChangeCreate, entity)
 	return result, nil
 }
 
@@ -795,6 +807,13 @@ func (q *Query[T]) upsert(ctx context.Context, entity *T, info *ModelInfo, confl
 	if err := runAfterCreate(ctx, entity); err != nil {
 		return nil, err
 	}
+	// ChangeCreate for an upsert that may have updated, because the statement
+	// does not say which it did: on Postgres DO NOTHING reports zero rows
+	// affected and DO UPDATE reports one, which is undocumented and differs
+	// on MySQL. An observer writing a whole document either way does not
+	// care, and one that needed to tell them apart could not be served
+	// honestly from here.
+	q.observe(ctx, ChangeCreate, entity)
 	return result, nil
 }
 
@@ -880,6 +899,7 @@ func (q *Query[T]) CreateBatch(ctx context.Context, entities []*T) (sql.Result, 
 		if err := runAfterCreate(ctx, entity); err != nil {
 			return nil, err
 		}
+		q.observe(ctx, ChangeCreate, entity)
 	}
 	return result, nil
 }
@@ -906,6 +926,7 @@ func (q *Query[T]) Update(ctx context.Context, entity *T) (sql.Result, error) {
 	if err := runAfterUpdate(ctx, entity); err != nil {
 		return nil, err
 	}
+	q.observe(ctx, ChangeUpdate, entity)
 	return result, nil
 }
 
@@ -987,6 +1008,7 @@ func (q *Query[T]) forceDelete(ctx context.Context, entity *T) (sql.Result, erro
 	if err := runAfterDelete(ctx, entity); err != nil {
 		return nil, err
 	}
+	q.observe(ctx, ChangeDelete, entity)
 	return result, nil
 }
 
@@ -1013,6 +1035,10 @@ func (q *Query[T]) softDelete(ctx context.Context, info *ModelInfo, entity *T) (
 	if err := runAfterDelete(ctx, entity); err != nil {
 		return nil, err
 	}
+	// ChangeDelete and not ChangeUpdate, although the statement is an UPDATE. What a
+	// soft delete means to everything downstream is that the row is gone,
+	// and an observer told "updated" would reindex a row it should remove.
+	q.observe(ctx, ChangeDelete, entity)
 	return result, nil
 }
 
@@ -1039,6 +1065,11 @@ func (q *Query[T]) Restore(ctx context.Context, entity *T) (sql.Result, error) {
 	if err != nil {
 		return nil, q.dialect.ClassifyError(err)
 	}
+	// Observed although Restore runs no AfterUpdate entity hook, which is a
+	// pre-existing asymmetry and not one to fix by staying silent here: a
+	// restored row that nothing announces stays missing from every index
+	// that removed it on the delete, and the only way back is a reimport.
+	q.observe(ctx, ChangeUpdate, entity)
 	return result, nil
 }
 

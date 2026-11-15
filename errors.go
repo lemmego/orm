@@ -13,6 +13,16 @@ var (
 	ErrUnsupported    = errors.New("orm: unsupported feature")
 	ErrNoRowsAffected = errors.New("orm: no rows affected")
 	ErrConstraint     = errors.New("orm: constraint violated")
+
+	// ErrAfterCommit means the transaction committed and something
+	// registered to run afterwards failed.
+	//
+	// It exists so those two outcomes are distinguishable, because the
+	// natural response to a commit error is to retry the unit of work — and
+	// retrying one that actually committed applies it twice. A caller seeing
+	// this should repair or report the callback, never replay the
+	// transaction.
+	ErrAfterCommit = errors.New("orm: the transaction committed but an after-commit callback failed")
 )
 
 // ConstraintKind classifies a constraint violation reported by the driver.

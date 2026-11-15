@@ -301,6 +301,7 @@ func setRelated(target, value reflect.Value) error {
 type RelationHandle[Parent, Child any] struct {
 	db       *DB
 	executor executor
+	sink     changeSink
 	dialect  Dialect
 	parent   *Parent
 	relation RelationInfo
@@ -311,12 +312,12 @@ type RelationHandle[Parent, Child any] struct {
 
 // Relation opens a handle onto the named association of parent.
 func (db *DB) Relation[Parent, Child any](parent *Parent, name string) *RelationHandle[Parent, Child] {
-	return newRelationHandle[Parent, Child](db, db.executor(), parent, name)
+	return newRelationHandle[Parent, Child](db, db.executor(), parent, name).observedBy(db)
 }
 
 // Relation mirrors DB.Relation inside a transaction.
 func (tx *Tx) Relation[Parent, Child any](parent *Parent, name string) *RelationHandle[Parent, Child] {
-	return newRelationHandle[Parent, Child](tx.db, tx.executor(), parent, name)
+	return newRelationHandle[Parent, Child](tx.db, tx.executor(), parent, name).observedBy(tx)
 }
 
 func newRelationHandle[Parent, Child any](db *DB, exec executor, parent *Parent, name string) *RelationHandle[Parent, Child] {
@@ -351,7 +352,7 @@ func newRelationHandle[Parent, Child any](db *DB, exec executor, parent *Parent,
 
 // Query returns a query over the related rows, ready for further filtering.
 func (h *RelationHandle[Parent, Child]) Query() *Query[Child] {
-	query := newQueryForTable[Child](h.db, h.executor, "")
+	query := newQueryForTable[Child](h.db, h.executor, "").observedBy(h.sink)
 	if h.err != nil {
 		query.err = h.err
 		return query
@@ -404,7 +405,7 @@ func (h *RelationHandle[Parent, Child]) Add(ctx context.Context, children ...*Ch
 	if h.relation.Kind == ManyToMany {
 		return h.Attach(ctx, children...)
 	}
-	query := newQueryForTable[Child](h.db, h.executor, h.child.Table)
+	query := newQueryForTable[Child](h.db, h.executor, h.child.Table).observedBy(h.sink)
 
 	for _, child := range children {
 		if child == nil {
@@ -446,7 +447,7 @@ func (h *RelationHandle[Parent, Child]) Remove(ctx context.Context, children ...
 			return err
 		}
 		target.SetZero()
-		parentQuery := newQueryForTable[Parent](h.db, h.executor, h.info.Table)
+		parentQuery := newQueryForTable[Parent](h.db, h.executor, h.info.Table).observedBy(h.sink).observedBy(h.sink)
 		_, err = parentQuery.Update(ctx, h.parent)
 		return err
 	}
@@ -455,7 +456,7 @@ func (h *RelationHandle[Parent, Child]) Remove(ctx context.Context, children ...
 	if err != nil {
 		return err
 	}
-	query := newQueryForTable[Child](h.db, h.executor, h.child.Table)
+	query := newQueryForTable[Child](h.db, h.executor, h.child.Table).observedBy(h.sink)
 	for _, child := range children {
 		if child == nil {
 			continue
@@ -507,7 +508,7 @@ func (h *RelationHandle[Parent, Child]) pointParentAt(ctx context.Context, child
 	if err := assignKey(target, source); err != nil {
 		return err
 	}
-	parentQuery := newQueryForTable[Parent](h.db, h.executor, h.info.Table)
+	parentQuery := newQueryForTable[Parent](h.db, h.executor, h.info.Table).observedBy(h.sink)
 	_, err = parentQuery.Update(ctx, h.parent)
 	return err
 }
@@ -1011,4 +1012,11 @@ func (h *RelationHandle[Parent, Child]) childKeys(children []*Child) ([]any, err
 		}
 	}
 	return keys, nil
+}
+
+// observedBy attaches the sink a relation's own writes announce themselves
+// through, so Add and Attach are observed exactly as Create is.
+func (h *RelationHandle[Parent, Child]) observedBy(sink changeSink) *RelationHandle[Parent, Child] {
+	h.sink = sink
+	return h
 }

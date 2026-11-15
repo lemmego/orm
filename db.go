@@ -3,12 +3,18 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 )
 
 type DB struct {
 	db      *sql.DB
 	dialect Dialect
 	logger  Logger
+
+	// observerState carries the registered observers and their lock. See
+	// observe.go.
+	observerState
 }
 
 type Option func(*DB)
@@ -36,7 +42,9 @@ func (db *DB) Dialect() Dialect { return db.dialect }
 // a method with its own type parameters can never satisfy an interface, so a
 // Querier abstraction carrying Model[T] would not compile.
 func (db *DB) Model[T any]() *Query[T] {
-	return newQuery[T](db, db.executor())
+	// Observed by the handle, so a write outside a transaction announces
+	// itself immediately.
+	return newQuery[T](db, db.executor()).observedBy(db)
 }
 
 // executor returns the connection, wrapped for logging when one is installed.
@@ -104,12 +112,22 @@ type Tx struct {
 	tx          *sql.Tx
 	closed      bool
 	afterCommit []func(context.Context) error
+
+	// changes are held until the commit succeeds, and discarded by a
+	// rollback. Unguarded, like closed and afterCommit beside it: a *Tx is a
+	// unit of work owned by one goroutine, and the statements it issues are
+	// serialised by database/sql anyway.
+	changes []Change
 }
 
 // Model and Raw mirror the DB methods so a transaction is a drop-in
 // replacement for the connection in any unit of work.
 func (tx *Tx) Model[T any]() *Query[T] {
-	return newQuery[T](tx.db, tx.executor())
+	// Observed by the transaction, not by the handle: a change raised here is
+	// held until the commit succeeds. This is the line that makes
+	// DB.Observe's after-commit guarantee true, and it is also where
+	// tx.Model used to throw the owning transaction away.
+	return newQuery[T](tx.db, tx.executor()).observedBy(tx)
 }
 
 // executor returns the transaction, wrapped for logging when one is installed.
@@ -144,10 +162,31 @@ func (tx *Tx) CommitContext(ctx context.Context) error {
 	if err := tx.tx.Commit(); err != nil {
 		return err
 	}
+
+	// Observers first, then the callbacks. An observer is the mechanical
+	// consequence of the writes — a search index, a cache — and a callback is
+	// what this caller wants done afterwards, so the index is up to date
+	// before anything is told to go and look at it.
+	changes := tx.changes
+	tx.changes = nil
+	tx.db.dispatch(ctx, changes...)
+
+	// Every callback runs, and their errors are joined rather than the first
+	// one returned. Stopping at the first would silently skip the rest, which
+	// for work registered after a commit means it simply never happens.
+	var failures []error
 	for _, callback := range tx.afterCommit {
 		if err := callback(ctx); err != nil {
-			return err
+			failures = append(failures, err)
 		}
+	}
+	if len(failures) > 0 {
+		// Wrapped, because the caller cannot otherwise tell this from a
+		// commit failure — and the natural response to a commit failure is to
+		// retry the unit of work, which here would apply it twice. The
+		// transaction committed; something registered to run afterwards did
+		// not.
+		return fmt.Errorf("%w: %w", ErrAfterCommit, errors.Join(failures...))
 	}
 	return nil
 }
@@ -200,5 +239,9 @@ func (tx *Tx) Rollback() error {
 		return nil
 	}
 	tx.closed = true
+	// Discarded, which is the point: nothing happened, so nothing is
+	// announced. A change dispatched here would tell an observer about a row
+	// that does not exist.
+	tx.changes = nil
 	return tx.tx.Rollback()
 }
