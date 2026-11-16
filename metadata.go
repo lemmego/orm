@@ -80,6 +80,16 @@ type ModelInfo struct {
 	Relations  []RelationInfo
 	ByRelation map[string]RelationInfo
 
+	// TenantKey is the column saying which tenant a row belongs to, and is
+	// nil for a model that is not tenant-scoped.
+	//
+	// Detected ONLY from an explicit `orm:"tenantKey"` tag — never from a
+	// conventional field name, unlike the lifecycle columns below. A
+	// convention here would mean that renaming a field silently changes
+	// whether a table is isolated, and the symptom of getting that wrong is
+	// one tenant reading another's rows.
+	TenantKey *FieldInfo
+
 	// Lifecycle columns, detected by tag or by conventional name. Nil when
 	// the model does not declare one.
 	SoftDelete *FieldInfo
@@ -199,6 +209,21 @@ func detectLifecycleColumns(typ reflect.Type, info *ModelInfo) error {
 	for i := range info.Fields {
 		field := &info.Fields[i]
 		switch {
+		case tagged[field.Name] == "tenantKey":
+			// Asked for explicitly, so refuse rather than silently
+			// misbehave. A nullable tenant key is a row no policy can match
+			// and no predicate can find, which is a row that has quietly
+			// left the application.
+			if !isTenantKeyType(field.Type) {
+				return fmt.Errorf(
+					"orm: tenant key %s.%s must be a non-nullable integer, string or [16]byte, got %s",
+					typ.Name(), field.Name, field.Type)
+			}
+			if info.TenantKey != nil {
+				return fmt.Errorf("orm: %s declares more than one tenantKey", typ.Name())
+			}
+			info.TenantKey = field
+
 		case tagged[field.Name] == "softDelete":
 			// Asked for explicitly, so refuse rather than silently misbehave:
 			// a non-nullable column can never satisfy "deleted_at IS NULL",
@@ -225,6 +250,28 @@ func detectLifecycleColumns(typ reflect.Type, info *ModelInfo) error {
 	return nil
 }
 
+// isTenantKeyType reports whether a field can carry a tenant identity.
+//
+// Pointers and sql.Null* are refused deliberately: a tenant key that can be
+// NULL is a row that matches no tenant predicate and no row-level security
+// policy, so it is invisible to the application and visible to anything that
+// bypasses both. Better to refuse the model at parse time.
+func isTenantKeyType(typ reflect.Type) bool {
+	if typ == nil || typ.Kind() == reflect.Pointer {
+		return false
+	}
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.String:
+		return true
+	case reflect.Array:
+		// [16]byte, which is how a UUID arrives when it is not a string.
+		return typ.Len() == 16 && typ.Elem().Kind() == reflect.Uint8
+	}
+	return false
+}
+
 // isNullableTime reports whether a field can represent SQL NULL, which soft
 // deletes depend on. A bare time.Time cannot: its zero value still writes a
 // real timestamp.
@@ -249,6 +296,8 @@ func taggedLifecycleFields(typ reflect.Type) map[string]string {
 			}
 			tag := parseORMTag(structTag(field))
 			switch {
+			case tag.tenantKey:
+				tagged[field.Name] = "tenantKey"
 			case tag.softDelete:
 				tagged[field.Name] = "softDelete"
 			case tag.autoCreateTime:
@@ -472,6 +521,7 @@ type ormTag struct {
 	primaryKey     bool
 	autoIncrement  bool
 	skip           bool
+	tenantKey      bool
 	softDelete     bool
 	autoCreateTime bool
 	autoUpdateTime bool
@@ -506,6 +556,8 @@ func parseORMTag(value string) ormTag {
 		case option == "autoIncrement":
 			result.autoIncrement = true
 			continue
+		case option == "tenantKey":
+			result.tenantKey = true
 		case option == "softDelete":
 			result.softDelete = true
 			continue

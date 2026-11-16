@@ -12,6 +12,11 @@ type DB struct {
 	dialect Dialect
 	logger  Logger
 
+	// tenantEnter is told about a tenant transaction as it opens, so the
+	// database can be scoped too. Nil when the application installs none.
+	// See tenant.go.
+	tenantEnter TenantEnter
+
 	// observerState carries the registered observers and their lock. See
 	// observe.go.
 	observerState
@@ -113,6 +118,11 @@ type Tx struct {
 	closed      bool
 	afterCommit []func(context.Context) error
 
+	// tenant is the tenant every query built from this transaction is
+	// filtered by, or nil for an unbound transaction. Set only by
+	// TenantTx; see tenant.go.
+	tenant *TenantBinding
+
 	// changes are held until the commit succeeds, and discarded by a
 	// rollback. Unguarded, like closed and afterCommit beside it: a *Tx is a
 	// unit of work owned by one goroutine, and the statements it issues are
@@ -130,8 +140,16 @@ func (tx *Tx) Model[T any]() *Query[T] {
 	return newQuery[T](tx.db, tx.executor()).observedBy(tx)
 }
 
-// executor returns the transaction, wrapped for logging when one is installed.
-func (tx *Tx) executor() executor { return withLogging(tx.tx, tx.db.logger) }
+// executor returns the transaction, wrapped for logging when one is installed
+// and carrying the tenant binding when this transaction has one.
+//
+// This is the one place tenancy propagates from. Every query, every relation
+// handle and every eager load is built from this executor, so a binding
+// attached here reaches all of them — which is why adding multi-tenancy did
+// not require changing any other signature in this package.
+func (tx *Tx) executor() executor {
+	return bindTenant(withLogging(tx.tx, tx.db.logger), tx.tenant)
+}
 
 func (tx *Tx) Raw[T any](query string, args ...any) *RawQuery[T] {
 	return &RawQuery[T]{executor: tx.executor(), dialect: tx.db.dialect, query: query, args: append([]any(nil), args...)}

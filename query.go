@@ -43,6 +43,13 @@ type Query[T any] struct {
 	offset   int
 	distinct bool
 
+	// tenantColumn and tenantValue are resolved once from T and the handle's
+	// binding, then carried through clone() and As[R] — so a reprojection or
+	// a filtered query cannot accidentally read another tenant's rows. An
+	// empty tenantColumn means T is not tenant-scoped.
+	tenantColumn string
+	tenantValue  any
+
 	// softDeleteColumn is resolved once from T and then carried through
 	// As[R], so a projection cannot accidentally read soft-deleted rows.
 	softDeleteColumn string
@@ -74,6 +81,18 @@ func newQuery[T any](db *DB, exec executor) *Query[T] {
 	query.table = info.Table
 	if info.SoftDelete != nil {
 		query.softDeleteColumn = info.SoftDelete.Column
+	}
+	if info.TenantKey != nil {
+		binding := tenantOf(exec)
+		if binding == nil {
+			// Fail closed, and fail at construction so that every terminal
+			// method — All, First, Count, Create, Paginate — reports it
+			// rather than one of them quietly returning everything.
+			query.err = fmt.Errorf("%w: %s (use DB.TenantTx)", ErrNoTenant, info.Table)
+			return query
+		}
+		query.tenantColumn = info.TenantKey.Column
+		query.tenantValue = binding.Value
 	}
 	return query
 }
@@ -225,6 +244,8 @@ func (q *Query[T]) As[R any]() *Query[R] {
 		limit:            q.limit,
 		offset:           q.offset,
 		distinct:         q.distinct,
+		tenantColumn:     q.tenantColumn,
+		tenantValue:      q.tenantValue,
 		softDeleteColumn: q.softDeleteColumn,
 		withTrashed:      q.withTrashed,
 		onlyTrashed:      q.onlyTrashed,
@@ -263,18 +284,40 @@ func (q *Query[T]) Scope(scopes ...Scope[T]) *Query[T] {
 // Scope is a reusable query modifier.
 type Scope[T any] func(*Query[T]) *Query[T]
 
-// scopedPredicates returns the user predicates plus the implicit soft-delete
-// filter. The two are kept apart because the bulk-mutation guard must only
-// count predicates the caller actually wrote.
+// scopedPredicates returns the user predicates plus the implicit tenant and
+// soft-delete filters.
+//
+// The implicit ones are kept apart from q.preds because the bulk-mutation
+// guard must only count predicates the caller actually wrote: a tenant filter
+// is not consent to rewrite a whole table, and neither is a soft-delete one.
 func (q *Query[T]) scopedPredicates() []Predicate {
-	if q.softDeleteColumn == "" || q.withTrashed {
+	implicit := make([]Predicate, 0, 2)
+
+	if q.tenantColumn != "" {
+		// Table-qualified, because a join brings in another table that may
+		// carry a column of the same name — and an ambiguous reference in a
+		// tenant filter is a query that either fails or filters the wrong
+		// table. newQueryForTable is called with an empty table in one
+		// relation path, where there is nothing to qualify with.
+		column := q.tenantColumn
+		if q.table != "" {
+			column = q.table + "." + column
+		}
+		implicit = append(implicit, Eq(column, q.tenantValue))
+	}
+
+	if q.softDeleteColumn != "" && !q.withTrashed {
+		filter := IsNull(q.softDeleteColumn)
+		if q.onlyTrashed {
+			filter = IsNotNull(q.softDeleteColumn)
+		}
+		implicit = append(implicit, filter)
+	}
+
+	if len(implicit) == 0 {
 		return q.preds
 	}
-	filter := IsNull(q.softDeleteColumn)
-	if q.onlyTrashed {
-		filter = IsNotNull(q.softDeleteColumn)
-	}
-	return append(append([]Predicate(nil), q.preds...), filter)
+	return append(append([]Predicate(nil), q.preds...), implicit...)
 }
 
 // SQL renders the SELECT statement and its arguments.
@@ -710,6 +753,54 @@ func (returningResult) LastInsertId() (int64, error) {
 }
 func (returningResult) RowsAffected() (int64, error) { return 1, nil }
 
+// stampTenant fills a tenant-scoped entity's tenant column from the handle's
+// binding, or refuses the write when the entity already names a different
+// tenant.
+//
+// Filling it rather than requiring the caller to is the point: no handler
+// writes the tenant column, so no handler can forget to, and a struct built
+// from a decoded request body cannot smuggle one in. Refusing a mismatch
+// rather than overwriting it is also deliberate — an entity that arrives
+// carrying another tenant is a bug somewhere upstream, and silently
+// rewriting it would hide the bug and move the row.
+//
+// Types must match exactly. A silent conversion between int and uint64 is how
+// a zero ends up in a tenant column.
+func (q *Query[T]) stampTenant(info *ModelInfo, value reflect.Value) error {
+	if info.TenantKey == nil {
+		return nil
+	}
+	if q.tenantColumn == "" {
+		return fmt.Errorf("%w: %s", ErrNoTenant, info.Table)
+	}
+
+	field, err := fieldByIndex(value, info.TenantKey.Index)
+	if err != nil {
+		return err
+	}
+
+	if !field.IsZero() {
+		if !sameTenant(field.Interface(), q.tenantValue) {
+			return fmt.Errorf("%w: %s.%s is %v, handle is bound to %v",
+				ErrTenantMismatch, info.Table, info.TenantKey.Column,
+				field.Interface(), q.tenantValue)
+		}
+		return nil
+	}
+
+	bound := reflect.ValueOf(q.tenantValue)
+	if !bound.IsValid() || bound.Type() != field.Type() {
+		return fmt.Errorf("%w: cannot write tenant %T into %s.%s of type %s",
+			ErrTenantMismatch, q.tenantValue, info.Table,
+			info.TenantKey.Column, field.Type())
+	}
+	if !field.CanSet() {
+		return fmt.Errorf("orm: tenant key %s.%s is not settable", info.Table, info.TenantKey.Column)
+	}
+	field.Set(bound)
+	return nil
+}
+
 func (q *Query[T]) InsertSQL(entity *T) (string, []any, error) {
 	info, err := modelInfoFor(reflect.TypeFor[T]())
 	if err != nil {
@@ -720,6 +811,9 @@ func (q *Query[T]) InsertSQL(entity *T) (string, []any, error) {
 		return "", nil, fmt.Errorf("orm: cannot insert a nil %s", info.Type)
 	}
 	value = value.Elem()
+	if err := q.stampTenant(info, value); err != nil {
+		return "", nil, err
+	}
 
 	columns := make([]string, 0, len(info.Fields))
 	placeholders := make([]string, 0, len(info.Fields))
@@ -877,6 +971,9 @@ func (q *Query[T]) CreateBatch(ctx context.Context, entities []*T) (sql.Result, 
 			return nil, fmt.Errorf("orm: cannot insert a nil %s", info.Type)
 		}
 		value = value.Elem()
+		if err := q.stampTenant(info, value); err != nil {
+			return nil, err
+		}
 		placeholders := make([]string, len(fields))
 		for i, field := range fields {
 			fieldValue, err := fieldByIndex(value, field.Index)
@@ -1223,21 +1320,58 @@ func (q *Query[T]) entityKey(entity *T) (*ModelInfo, reflect.Value, []FieldInfo,
 	if len(info.PrimaryKeys) == 0 {
 		return nil, reflect.Value{}, nil, fmt.Errorf("orm: model %s has no primary key", info.Type)
 	}
+
+	// An entity that names a different tenant is refused here, loudly, rather
+	// than left to the WHERE clause.
+	//
+	// The predicate alone would make the statement affect zero rows, which is
+	// safe but silent — and a caller who sees a successful Update that changed
+	// nothing will not go looking for the reason. Handing a row from another
+	// tenant to a write is a bug somewhere above this call, and it should read
+	// like one. A zero value is fine: the predicate still scopes the
+	// statement, so an entity that simply never carried a tenant is updated
+	// within the bound one or not at all.
+	if info.TenantKey != nil && q.tenantColumn != "" {
+		field, err := fieldByIndex(value.Elem(), info.TenantKey.Index)
+		if err != nil {
+			return nil, reflect.Value{}, nil, err
+		}
+		if !field.IsZero() && !sameTenant(field.Interface(), q.tenantValue) {
+			return nil, reflect.Value{}, nil, fmt.Errorf(
+				"%w: %s.%s is %v, handle is bound to %v",
+				ErrTenantMismatch, info.Table, info.TenantKey.Column,
+				field.Interface(), q.tenantValue)
+		}
+	}
+
 	return info, value.Elem(), info.PrimaryKeys, nil
 }
 
 // keyPredicateSQL renders the WHERE clause addressing one row by its primary
 // key, which is one column for most models and several for a composite key.
 func (q *Query[T]) keyPredicateSQL(value reflect.Value, keys []FieldInfo, args *[]any, next *int) (string, error) {
-	clauses := make([]string, len(keys))
-	for i, key := range keys {
+	clauses := make([]string, 0, len(keys)+1)
+	for _, key := range keys {
 		keyValue, err := fieldByIndex(value, key.Index)
 		if err != nil {
 			return "", err
 		}
 		*args = append(*args, keyValue.Interface())
-		clauses[i] = q.dialect.Quote(key.Column) + " = " + nextPlaceholder(q.dialect, next)
+		clauses = append(clauses, q.dialect.Quote(key.Column)+" = "+nextPlaceholder(q.dialect, next))
 	}
+
+	// The tenant filter belongs here and not in scopedPredicates, because
+	// none of the statements that address a single row by its key go through
+	// that function: UpdateSQL, DeleteSQL, softDelete, forceDelete and
+	// Restore all build their WHERE from this one. Without this line, an
+	// entity loaded somewhere else and handed to Update would be written
+	// across tenants — row-level security would refuse it, but this package
+	// should not be the layer that tried.
+	if q.tenantColumn != "" {
+		*args = append(*args, q.tenantValue)
+		clauses = append(clauses, q.dialect.Quote(q.tenantColumn)+" = "+nextPlaceholder(q.dialect, next))
+	}
+
 	return strings.Join(clauses, " AND "), nil
 }
 

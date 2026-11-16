@@ -214,7 +214,24 @@ func fetchByKeys(ctx context.Context, exec executor, dialect Dialect, info *Mode
 			query += " AND " + dialect.Quote(info.SoftDelete.Column) + " IS NULL"
 		}
 
-		rows, err := exec.QueryContext(ctx, query, chunk...)
+		// And the same argument for tenancy: a tenant-scoped child is
+		// filtered on a direct query, so it must be filtered through its
+		// parent too. In practice the foreign key already confines the
+		// result — the parent rows were themselves filtered, and a child in
+		// another tenant would have to share a key value with our parent —
+		// but "in practice" is doing a lot of work in that sentence, and the
+		// predicate costs one placeholder.
+		args := append([]any(nil), chunk...)
+		if info.TenantKey != nil {
+			binding := tenantOf(exec)
+			if binding == nil {
+				return reflect.Value{}, fmt.Errorf("%w: %s (eager load)", ErrNoTenant, info.Table)
+			}
+			query += " AND " + dialect.Quote(info.TenantKey.Column) + " = " + nextPlaceholder(dialect, &next)
+			args = append(args, binding.Value)
+		}
+
+		rows, err := exec.QueryContext(ctx, query, args...)
 		if err != nil {
 			return reflect.Value{}, dialect.ClassifyError(err)
 		}
@@ -635,6 +652,16 @@ func loadManyToMany(ctx context.Context, exec executor, dialect Dialect, parents
 
 // fetchPivotLinks reads the join table and returns parent key -> target keys,
 // plus the distinct target keys to fetch.
+// fetchPivotLinks reads the pivot rows joining parents to targets.
+//
+// This one carries NO tenant predicate, and the reason is worth stating rather
+// than leaving as an omission: a pivot is a bare table with no model and
+// therefore no declared tenant column, so there is nothing here to filter on.
+// Guessing a column name would be the naming convention that metadata.go
+// deliberately refuses for exactly this reason. A tenant-scoped pivot is
+// protected by row-level security and by having its tenant column inside its
+// primary key and its composite foreign keys, which is where that guarantee
+// belongs.
 func fetchPivotLinks(ctx context.Context, exec executor, dialect Dialect, plan pivotPlan, parentKeys []any) (map[any][]any, []any, error) {
 	links := make(map[any][]any, len(parentKeys))
 	var targetKeys []any
