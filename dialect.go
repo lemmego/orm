@@ -30,6 +30,35 @@ type Dialect interface {
 	UpsertClause(conflict, update []string) (string, error)
 }
 
+// TenantEnterDialect is the optional interface a dialect implements when the
+// database can be told, inside a transaction, which tenant that transaction
+// is for.
+//
+// # Why optional rather than a method on Dialect
+//
+// Not every database can do this. PostgreSQL has transaction-local settings,
+// which is what makes row-level security keyed on the current tenant
+// possible; MySQL and SQLite have nothing equivalent. A method on Dialect
+// would force both of them to stub a feature they do not have, and a stub
+// that returns an empty statement is a tenant binding that silently does
+// nothing — the exact failure the tenant seam exists to prevent.
+//
+// So the capability is declared by implementing the interface, read with a
+// type assertion, and its absence is an answer rather than a gap. That is the
+// shape cache.LockProvider and search.Indexer already use for the same
+// reason, and SupportsReturning is the flag-shaped version of it here.
+type TenantEnterDialect interface {
+	// TenantEnterSQL renders the statement that binds a tenant for the
+	// remainder of the current transaction.
+	//
+	// The statement takes exactly two placeholders in the dialect's own
+	// spelling: the setting's name, then the tenant's value as text. It must
+	// be TRANSACTION-local — a session-level setting would survive the
+	// transaction and reach the next request to use that pooled connection,
+	// which is worse than not binding at all.
+	TenantEnterSQL() string
+}
+
 // conflictTargetClause renders the "ON CONFLICT (a, b)" target shared by the
 // dialects that follow the SQL-standard spelling.
 func conflictTargetClause(dialect Dialect, conflict, update []string) (string, error) {
@@ -63,6 +92,21 @@ func (postgresDialect) Name() string             { return "postgres" }
 func (postgresDialect) Quote(name string) string { return `"` + name + `"` }
 func (postgresDialect) Placeholder(n int) string { return fmt.Sprintf("$%d", n) }
 func (postgresDialect) SupportsReturning() bool  { return true }
+
+// TenantEnterSQL is set_config with is_local true.
+//
+// The third argument is the whole reason this is safe under a connection
+// pooler in transaction mode: true makes the setting reset at COMMIT or
+// ROLLBACK, so the connection goes back to the pool carrying no tenant. A
+// session-level SET, or set_config(..., false), would leak this transaction's
+// tenant to whoever gets the connection next — and would look perfect in
+// development, where there is one connection and one user.
+func (postgresDialect) TenantEnterSQL() string { return "SELECT set_config($1, $2, true)" }
+
+// Declared rather than inferred: this is the class of thing a compile-time
+// assertion cannot get wrong, and the one place a typo in the method name
+// would otherwise present as "PostgreSQL cannot bind a tenant".
+var _ TenantEnterDialect = postgresDialect{}
 
 func (d postgresDialect) UpsertClause(conflict, update []string) (string, error) {
 	return conflictTargetClause(d, conflict, update)

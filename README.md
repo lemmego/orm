@@ -334,6 +334,86 @@ so they are validated as plain identifiers; anything else returns
 `ErrInvalidIdentifier`. `CheckIdentifier` is exported for callers that build
 names themselves.
 
+## Multi-tenancy
+
+A model joins one tenant's rows by tagging exactly one field:
+
+```go
+type Invoice struct {
+    TenantID uint64 `db:"tenant_id" orm:"tenantKey"`
+    ID       uint64 `db:"id" orm:"primaryKey;autoIncrement"`
+    Total    int64  `db:"total_cents"`
+}
+```
+
+The binding rides on the **handle**, not the context, because a `Query[T]`
+carries no context — the context arrives at execution, after the predicates
+have been decided. So a tenant-scoped model is read and written through a
+tenant transaction:
+
+```go
+err := db.TenantTx(ctx, tenantID, func(tx *orm.Tx) error {
+    invoices, err := tx.Model[Invoice]().All(ctx)   // filtered
+    _, err = tx.Model[Invoice]().Create(ctx, &Invoice{Total: 500}) // stamped
+    return err
+})
+```
+
+**It fails closed.** `db.Model[Invoice]()` on an unbound handle sets the error
+at construction, so every terminal method reports it rather than one of them
+quietly returning every tenant's rows. An insert naming a different tenant is
+`ErrTenantMismatch`, not a silently-filtered write.
+
+The predicate reaches reads, counts, pagination, bulk mutations,
+single-row writes, soft deletes and eager loads. Two things it does not reach,
+on purpose: **`Raw` SQL**, because there is nowhere to inject a predicate into
+a hand-written statement, and **many-to-many pivot reads**, because a pivot is
+a bare table with no model and therefore no declared tenant column — guessing
+the name is the naming convention the metadata parser refuses.
+
+Which is why this layer is the one that gives you a good error message rather
+than the one that makes the guarantee.
+
+### Telling the database too
+
+The guarantee wants the database enforcing the same value, which on PostgreSQL
+means row-level security reading a transaction-local setting. This package
+does not know what that setting is called or whether a policy reads it — but
+it does know what statement the dialect needs:
+
+```go
+db := orm.Open(sqlDB, orm.Postgres(),
+    orm.WithTenantEnter(orm.SetTenantSetting("acme.tenant_id")))
+```
+
+`SetTenantSetting` runs once as each tenant transaction opens, before any
+statement in it, and asks the dialect for the SQL. On PostgreSQL that is
+`set_config(name, value, true)` — **transaction-local**, so it resets at
+commit or rollback and cannot reach the next user of a pooled connection,
+which is what makes the arrangement safe behind a pooler in transaction mode.
+A session-level `SET` would leak the tenant, and would look perfect in
+development under one connection and one user.
+
+`TenantEnterDialect` is **optional and type-asserted**: PostgreSQL implements
+it, MySQL and SQLite do not, and their not implementing it is an answer rather
+than a gap. Ask before you promise:
+
+```go
+if _, ok := orm.TenantEnterStatement(db.Dialect()); !ok {
+    return fmt.Errorf("this database cannot enforce tenant isolation: %s",
+        db.Dialect().Name())
+}
+```
+
+Without that check, an application that asked for two isolation layers gets
+one and nothing says so. `SetTenantSetting` itself returns
+`ErrTenantSettingUnsupported` naming the dialect the first time a tenant
+transaction opens, and rolls it back rather than running statements against a
+transaction the database does not consider scoped.
+
+`WithTenantEnter` remains the escape hatch for a database whose binding this
+package has never heard of.
+
 ## Observing writes
 
 `db.Observe` registers a process-wide observer, called after a successful

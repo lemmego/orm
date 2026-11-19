@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -491,5 +492,125 @@ func TestAnUnusableTenantKeyIsRefusedAtParseTime(t *testing.T) {
 				t.Fatal("want a parse error for an unusable tenant key, got nil")
 			}
 		})
+	}
+}
+
+// Binding a tenant inside a transaction is a capability, not a given, and
+// only PostgreSQL has it among the three dialects here.
+//
+// Asserted through the exported seam rather than by asserting the interface
+// directly, because TenantEnterStatement is what a multi-tenancy layer will
+// call at boot to decide whether it can promise two isolation layers or one.
+func TestOnlyPostgresCanBindATenantToATransaction(t *testing.T) {
+	statement, ok := TenantEnterStatement(Postgres())
+	if !ok {
+		t.Fatal("postgres cannot bind a tenant, which is the one dialect that must")
+	}
+	if statement == "" {
+		t.Fatal("postgres reported the capability and returned no statement")
+	}
+
+	for _, dialect := range []Dialect{MySQL(), SQLite()} {
+		if got, ok := TenantEnterStatement(dialect); ok {
+			t.Errorf("%s claims it can bind a tenant, returning %q", dialect.Name(), got)
+		}
+	}
+}
+
+// The setting must be transaction-local.
+//
+// A string assertion, deliberately: the semantics cannot be checked without a
+// real PostgreSQL — ormconnector's integration suite does that — but the
+// third argument to set_config is the whole safety property, and `false`
+// there would leak this transaction's tenant to the next request on a pooled
+// connection while working perfectly in development. So the literal is
+// pinned here, where it is free, and the behaviour is proven there.
+func TestTheTenantSettingIsTransactionLocal(t *testing.T) {
+	statement, _ := TenantEnterStatement(Postgres())
+
+	if !strings.Contains(statement, "set_config") {
+		t.Fatalf("statement %q does not set a setting", statement)
+	}
+	if !strings.Contains(strings.ReplaceAll(statement, " ", ""), ",true)") {
+		t.Fatalf("statement %q does not pass is_local=true, so the tenant would "+
+			"survive the transaction and reach the next request on this connection", statement)
+	}
+	// Two placeholders, in the order SetTenantSetting binds them.
+	if !strings.Contains(statement, "$1") || !strings.Contains(statement, "$2") {
+		t.Fatalf("statement %q does not take the setting name and the value as parameters", statement)
+	}
+}
+
+// On a database that cannot bind a tenant, asking for one fails loudly and
+// the transaction does not proceed.
+//
+// The alternative — a hook that quietly does nothing — would leave an
+// application believing it had row-level security behind the ORM's predicate
+// when it had only the predicate. Half the isolation it asked for, with
+// nothing to say so.
+func TestBindingATenantOnADatabaseThatCannotIsRefused(t *testing.T) {
+	db, ctx := openTenantDB(t)
+	WithTenantEnter(SetTenantSetting("acme.tenant_id"))(db)
+
+	ran := false
+	err := db.TenantTx(ctx, alpha, func(tx *Tx) error {
+		ran = true
+		_, err := tx.Model[Doc]().Create(ctx, &Doc{Title: "should never exist"})
+		return err
+	})
+
+	if !errors.Is(err, ErrTenantSettingUnsupported) {
+		t.Fatalf("TenantTx error = %v, want ErrTenantSettingUnsupported", err)
+	}
+	if !strings.Contains(err.Error(), "sqlite") {
+		t.Errorf("the error does not name the dialect that cannot do it: %v", err)
+	}
+	if ran {
+		t.Error("the callback ran, so statements were executed against an unbound transaction")
+	}
+
+	// And nothing was written, which is what rolling back on a failed enter
+	// is for.
+	var count int
+	if err := db.SQLDB().QueryRow(`SELECT count(*) FROM docs`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("%d rows survived a transaction whose tenant was never bound", count)
+	}
+}
+
+// A setting holds text, so every tenant key type has to render as the
+// spelling the database will compare against.
+func TestATenantRendersAsTheTextTheSettingHolds(t *testing.T) {
+	uuid := [16]byte{0x0f, 0x8c, 0x4b, 0x2a, 0x1d, 0x3e, 0x4f, 0x5a,
+		0x9b, 0x7c, 0x2e, 0x6d, 0x8a, 0x0f, 0x1b, 0x3c}
+
+	for name, tc := range map[string]struct {
+		value any
+		want  string
+	}{
+		"a string":   {value: "acme", want: "acme"},
+		"an integer": {value: 42, want: "42"},
+		"a uint64":   {value: uint64(42), want: "42"},
+		// The case fmt.Sprint gets wrong: it would render "[15 140 75 ...]",
+		// which a policy casting to uuid rejects — and the failure reads as a
+		// broken policy rather than a mis-rendered value.
+		"a uuid as bytes": {value: uuid, want: "0f8c4b2a-1d3e-4f5a-9b7c-2e6d8a0f1b3c"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := tenantSettingText(tc.value)
+			if err != nil {
+				t.Fatalf("tenantSettingText(%v): %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Errorf("tenantSettingText(%v) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+
+	// A type no model could carry is refused rather than guessed at.
+	if _, err := tenantSettingText(3.14); !errors.Is(err, ErrTenantSettingUnsupported) {
+		t.Errorf("a float tenant gave %v, want ErrTenantSettingUnsupported", err)
 	}
 }

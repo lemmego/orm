@@ -98,6 +98,87 @@ func WithTenantEnter(fn TenantEnter) Option {
 	return func(db *DB) { db.tenantEnter = fn }
 }
 
+// ErrTenantSettingUnsupported means the dialect cannot bind a tenant to a
+// transaction, so the database has no way to agree with the ORM about whose
+// rows these are.
+//
+// Returned rather than ignored. An application that wanted row-level security
+// and is running on a database without transaction-local settings has one
+// isolation layer where it believed it had two, and the only honest moment to
+// say so is the first time it tries.
+var ErrTenantSettingUnsupported = errors.New("orm: this dialect cannot bind a tenant to a transaction")
+
+// TenantEnterStatement returns the statement that binds a tenant for the rest
+// of a transaction, and whether this dialect has one.
+//
+// The type assertion lives here so there is exactly one of it. A caller that
+// wants to refuse at boot rather than at the first request asks this
+// question during start-up, which is what a multi-tenancy layer should do:
+// "this database cannot enforce what you asked for" is a configuration error,
+// not a runtime one.
+func TenantEnterStatement(dialect Dialect) (string, bool) {
+	enterer, ok := dialect.(TenantEnterDialect)
+	if !ok {
+		return "", false
+	}
+	return enterer.TenantEnterSQL(), true
+}
+
+// SetTenantSetting returns a TenantEnter that binds the transaction's tenant
+// to a transaction-local setting of the given name.
+//
+// This is what keeps vendor SQL out of application code. Before it, every
+// multi-tenant application wrote its own `SELECT set_config($1, $2, true)` at
+// a call site — one more place to pass false by mistake, and one more place
+// that only works on PostgreSQL without saying so.
+//
+//	orm.Open(db, orm.Postgres(), orm.WithTenantEnter(
+//	    orm.SetTenantSetting("acme.tenant_id")))
+//
+// The setting's name belongs to the caller: this package does not know
+// whether there is row-level security reading it, or what it is called.
+func SetTenantSetting(setting string) TenantEnter {
+	return func(ctx context.Context, tx *Tx, value any) error {
+		query, ok := TenantEnterStatement(tx.Dialect())
+		if !ok {
+			return fmt.Errorf("%w: %s", ErrTenantSettingUnsupported, tx.Dialect().Name())
+		}
+		text, err := tenantSettingText(value)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, query, setting, text)
+		return err
+	}
+}
+
+// tenantSettingText renders a tenant key as the text a session setting holds.
+//
+// A setting is text, and every tenant key type has to arrive as the spelling
+// the database will compare against. The case that matters is [16]byte: it is
+// how a UUID arrives when a model does not hold it as a string, and
+// fmt.Sprint would render it as "[15 140 75 ...]", which a policy casting to
+// uuid rejects — a failure that reads as a broken policy rather than a
+// mis-rendered value.
+func tenantSettingText(value any) (string, error) {
+	switch typed := value.(type) {
+	case string:
+		return typed, nil
+	case [16]byte:
+		return fmt.Sprintf("%x-%x-%x-%x-%x",
+			typed[0:4], typed[4:6], typed[6:8], typed[8:10], typed[10:16]), nil
+	case int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprint(typed), nil
+	}
+	// Deliberately not fmt.Sprint as a fallback. A type the tenant seam does
+	// not recognise is a binding nobody can predict the database's reading
+	// of, and metadata.go already refuses such a type on the model — so
+	// reaching here means a value was bound that no model could carry.
+	return "", fmt.Errorf("%w: cannot render a tenant of type %T as a setting",
+		ErrTenantSettingUnsupported, value)
+}
+
 // TenantTx runs fn inside a transaction bound to one tenant.
 //
 // Every query built from the *Tx is filtered by the tenant column, and the
