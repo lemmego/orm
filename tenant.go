@@ -231,6 +231,29 @@ func (tx *Tx) TenantValue() (any, bool) {
 	return tx.tenant.Value, true
 }
 
+// BindTenant binds an externally opened transaction after the application has
+// created or resolved the tenant inside it. The configured tenant-enter hook
+// runs before tenant-scoped ORM queries are allowed to execute.
+func (tx *Tx) BindTenant(ctx context.Context, value any) error {
+	if tx.closed {
+		return ErrClosed
+	}
+	if value == nil {
+		return fmt.Errorf("%w: BindTenant needs a tenant", ErrNoTenant)
+	}
+	if tx.tenant != nil {
+		return fmt.Errorf("orm: transaction is already bound to a tenant")
+	}
+	if tx.db.tenantEnter == nil {
+		return fmt.Errorf("%w: no tenant-enter hook is configured", ErrTenantSettingUnsupported)
+	}
+	if err := tx.db.tenantEnter(ctx, tx, value); err != nil {
+		return err
+	}
+	tx.tenant = &TenantBinding{Value: value}
+	return nil
+}
+
 // sameTenant compares a value read off an entity with the bound one.
 //
 // Types must match exactly. A silent conversion between, say, int and uint64

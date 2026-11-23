@@ -137,6 +137,7 @@ type FieldInfo struct {
 	Type          reflect.Type
 	PrimaryKey    bool
 	AutoIncrement bool
+	Default       bool
 }
 
 // TableNamer lets a model override the inflected table name.
@@ -436,6 +437,7 @@ func collectFields(typ reflect.Type, parent []int, info *ModelInfo) error {
 			Type:          field.Type,
 			PrimaryKey:    tag.primaryKey,
 			AutoIncrement: tag.autoIncrement,
+			Default:       tag.defaultValue,
 		}
 		info.Fields = append(info.Fields, metadata)
 		info.ByColumn[column] = metadata
@@ -520,6 +522,7 @@ type ormTag struct {
 	column         string
 	primaryKey     bool
 	autoIncrement  bool
+	defaultValue   bool
 	skip           bool
 	tenantKey      bool
 	softDelete     bool
@@ -555,6 +558,9 @@ func parseORMTag(value string) ormTag {
 			continue
 		case option == "autoIncrement":
 			result.autoIncrement = true
+			continue
+		case option == "default":
+			result.defaultValue = true
 			continue
 		case option == "tenantKey":
 			result.tenantKey = true

@@ -2,6 +2,7 @@ package orm_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -139,10 +140,35 @@ func documentedRelations(db *orm.DB, ctx context.Context) {
 	_ = rel.Load(ctx)
 }
 
+type docGuard struct {
+	ID     int `orm:"primaryKey;autoIncrement"`
+	UserID int
+}
+
+func documentedAdvancedQueries(db *orm.DB, ctx context.Context) {
+	query := db.Model[docUser]().
+		Join[docPost](orm.ColEq("doc_posts.user_id", "doc_users.id")).
+		SelectExpr(orm.Expr(`doc_users.id AS user_id`), orm.Expr(`lower(doc_users.email) AS email`))
+	_, _ = query.As[docUser]().All(ctx)
+
+	guard := db.Model[docGuard]().Where(orm.Eq("user_id", 1))
+	_, _ = orm.CreateIf(ctx, db.Model[docPost](), &docPost{UserID: 1}, guard)
+	_, _ = db.Model[docUser]().UpsertExprWhere(ctx, &docUser{Email: "ada@example.test"},
+		[]string{"email"}, map[string]orm.SQLExpr{"active": orm.Expr("EXCLUDED.active")},
+		orm.ColGte("excluded.created_at", "doc_users.created_at"))
+	_, _ = db.Model[docUser]().Where(orm.Eq("id", 1)).UpdateAll(ctx, map[string]any{"created_at": orm.Expr("now()")})
+	_, _ = db.Model[docUser]().InsertIgnoreReturning(ctx, &docUser{Email: "ada@example.test"}, "email")
+
+	var sqlTx *sql.Tx
+	wrapped := db.WrapTx(sqlTx)
+	_ = wrapped.BindTenant(ctx, "workspace-id")
+}
+
 func TestDocsOrmSurfaceCompiles(t *testing.T) {
 	// Referenced rather than called: each needs a live connection, and the
 	// signature is what is being checked.
 	_ = documentedQueryChain
 	_ = documentedWrites
 	_ = documentedRelations
+	_ = documentedAdvancedQueries
 }

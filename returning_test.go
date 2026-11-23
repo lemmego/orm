@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // The RETURNING path cannot be exercised by SQLite, so a stub driver stands in
@@ -30,6 +31,7 @@ type fakeConn struct {
 	lastQuery  string
 	queryCalls int
 	execCalls  int
+	lastArgs   []driver.NamedValue
 }
 
 func (c *fakeConn) Prepare(string) (driver.Stmt, error) {
@@ -38,15 +40,17 @@ func (c *fakeConn) Prepare(string) (driver.Stmt, error) {
 func (c *fakeConn) Close() error              { return nil }
 func (c *fakeConn) Begin() (driver.Tx, error) { return nil, errors.New("fake: no transactions") }
 
-func (c *fakeConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *fakeConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.queryCalls++
 	c.lastQuery = query
+	c.lastArgs = append([]driver.NamedValue(nil), args...)
 	return &fakeRows{columns: c.columns, data: c.rows}, nil
 }
 
-func (c *fakeConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+func (c *fakeConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.execCalls++
 	c.lastQuery = query
+	c.lastArgs = append([]driver.NamedValue(nil), args...)
 	return fakeExecResult{lastInsert: c.lastInsert}, nil
 }
 
@@ -151,4 +155,119 @@ func TestExplicitKeySkipsGeneration(t *testing.T) {
 	if !strings.Contains(conn.lastQuery, "`id`") {
 		t.Fatalf("an explicit key must be written as a column: %s", conn.lastQuery)
 	}
+}
+
+func TestDefaultPrimaryKeyUsesReturning(t *testing.T) {
+	conn := &fakeConn{columns: []string{"id"}, rows: [][]driver.Value{{"generated-uuid"}}}
+	db := openFakeDB(t, Postgres(), conn)
+
+	entity := &GeneratedUUID{Name: "entry"}
+	if _, err := db.Model[GeneratedUUID]().Create(context.Background(), entity); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(conn.lastQuery, `INSERT INTO "generated_uuids" ("name") VALUES ($1) RETURNING "id"`) {
+		t.Fatalf("expected generated default key to be omitted and returned, got %s", conn.lastQuery)
+	}
+	if entity.ID != "generated-uuid" {
+		t.Fatalf("expected generated key to be written back, got %q", entity.ID)
+	}
+}
+
+type GuardedEntity struct {
+	ID     int    `orm:"primaryKey;autoIncrement"`
+	SiteID int    `db:"site_id"`
+	Title  string `db:"title"`
+}
+
+type ClientSiteGrant struct {
+	ID     int `orm:"primaryKey;autoIncrement"`
+	SiteID int `db:"site_id"`
+	UserID int `db:"user_id"`
+}
+
+func TestCreateIfKeepsGuardAndInsertAtomic(t *testing.T) {
+	conn := &fakeConn{columns: []string{"id"}, rows: [][]driver.Value{{int64(5)}}}
+	db := openFakeDB(t, Postgres(), conn)
+	entity := &GuardedEntity{SiteID: 12, Title: "report"}
+	guard := db.Model[ClientSiteGrant]().Where(Eq("site_id", 12), Eq("user_id", 9))
+	if _, err := CreateIf(context.Background(), db.Model[GuardedEntity](), entity, guard); err != nil {
+		t.Fatal(err)
+	}
+	want := `INSERT INTO "guarded_entities" ("site_id", "title") SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM "client_site_grants" WHERE "site_id" = $3 AND "user_id" = $4) RETURNING "id"`
+	if conn.lastQuery != want {
+		t.Fatalf("got %s, want %s", conn.lastQuery, want)
+	}
+	if len(conn.lastArgs) != 4 || conn.lastArgs[0].Value != int64(12) || conn.lastArgs[1].Value != "report" || conn.lastArgs[2].Value != int64(12) || conn.lastArgs[3].Value != int64(9) {
+		t.Fatalf("unexpected bound arguments: %#v", conn.lastArgs)
+	}
+	if entity.ID != 5 {
+		t.Fatalf("expected generated ID 5, got %d", entity.ID)
+	}
+}
+
+func TestUpsertExprRenumbersBoundAssignmentExpressions(t *testing.T) {
+	conn := &fakeConn{}
+	db := openFakeDB(t, Postgres(), conn)
+	user := &User{Email: "upsert@example.com", CreatedAt: 17}
+	_, err := db.Model[User]().UpsertExpr(context.Background(), user, []string{"email_address"}, map[string]SQLExpr{
+		"name": Expr("CASE WHEN users.created_at = ? THEN ? ELSE ? END", int64(17), "same", "changed"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `INSERT INTO "users" ("email_address", "created_at") VALUES ($1, $2) ON CONFLICT ("email_address") DO UPDATE SET "name" = CASE WHEN users.created_at = $3 THEN $4 ELSE $5 END`
+	if conn.lastQuery != want {
+		t.Fatalf("got %s, want %s", conn.lastQuery, want)
+	}
+	if len(conn.lastArgs) != 5 || conn.lastArgs[2].Value != int64(17) || conn.lastArgs[3].Value != "same" || conn.lastArgs[4].Value != "changed" {
+		t.Fatalf("unexpected arguments: %#v", conn.lastArgs)
+	}
+}
+
+func TestUpsertExprWhereKeepsMonotonicPredicateAtomic(t *testing.T) {
+	conn := &fakeConn{}
+	db := openFakeDB(t, Postgres(), conn)
+	user := &User{Email: "upsert-where@example.com", CreatedAt: 17}
+	_, err := db.Model[User]().UpsertExprWhere(context.Background(), user, []string{"email_address"}, map[string]SQLExpr{
+		"name": Expr("EXCLUDED.name"),
+	}, ColGte("excluded.created_at", "users.created_at"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `INSERT INTO "users" ("email_address", "created_at") VALUES ($1, $2) ON CONFLICT ("email_address") DO UPDATE SET "name" = EXCLUDED.name WHERE "excluded"."created_at" >= "users"."created_at"`
+	if conn.lastQuery != want {
+		t.Fatalf("got %s, want %s", conn.lastQuery, want)
+	}
+}
+
+func TestInsertIgnoreReturningDistinguishesInsertedFromConflict(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		rows [][]driver.Value
+		want bool
+	}{
+		{name: "inserted", rows: [][]driver.Value{{"token-id"}}, want: true},
+		{name: "conflict", rows: nil, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := &fakeConn{columns: []string{"id"}, rows: tt.rows}
+			db := openFakeDB(t, Postgres(), conn)
+			inserted, err := db.Model[HandoffToken]().InsertIgnoreReturning(context.Background(), &HandoffToken{ID: "token-id", ExpiresAt: time.Now()}, "id")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inserted != tt.want {
+				t.Fatalf("inserted = %v, want %v", inserted, tt.want)
+			}
+			if !strings.Contains(conn.lastQuery, `RETURNING "id"`) {
+				t.Fatalf("expected RETURNING clause, got %s", conn.lastQuery)
+			}
+		})
+	}
+}
+
+type HandoffToken struct {
+	ID         string    `orm:"primaryKey"`
+	ExpiresAt  time.Time `db:"expires_at"`
+	ConsumedAt time.Time `db:"consumed_at" orm:"default"`
 }

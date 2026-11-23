@@ -62,6 +62,11 @@ type UserEmail struct {
 	Email string `orm:"column:email_address"`
 }
 
+type GeneratedUUID struct {
+	ID   string `orm:"primaryKey;default"`
+	Name string
+}
+
 var (
 	userActive = NewField[User, bool]("active")
 	userID     = NewField[User, int]("id")
@@ -74,6 +79,40 @@ func TestSelectNamesColumnsInsteadOfStar(t *testing.T) {
 	want := `SELECT "id", "email_address", "created_at" FROM "users"`
 	if query != want {
 		t.Fatalf("got  %s\nwant %s", query, want)
+	}
+}
+
+func TestGeneratedDefaultPrimaryKeyIsOmittedAndReturned(t *testing.T) {
+	query, args, err := testDB(Postgres()).Model[GeneratedUUID]().InsertSQL(&GeneratedUUID{Name: "entry"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query != `INSERT INTO "generated_uuids" ("name") VALUES ($1)` || !reflect.DeepEqual(args, []any{"entry"}) {
+		t.Fatalf("generated key should be omitted: %s %#v", query, args)
+	}
+}
+
+func TestSelectExprAndColumnPredicate(t *testing.T) {
+	query, args := testDB(Postgres()).Model[User]().
+		Join[Post](ColEq("posts.user_id", "users.id")).
+		SelectExpr(Expr(`users.id AS user_id`), Expr(`posts.title AS post_title`)).
+		Where(Eq("users.active", true)).SQL()
+	want := `SELECT users.id AS user_id, posts.title AS post_title FROM "users" INNER JOIN "posts" ON "posts"."user_id" = "users"."id" WHERE "users"."active" = $1`
+	if query != want || !reflect.DeepEqual(args, []any{true}) {
+		t.Fatalf("got %s %#v, want %s %#v", query, args, want, []any{true})
+	}
+}
+
+func TestUpdateAllAcceptsExpressions(t *testing.T) {
+	query, args, err := testDB(Postgres()).Model[User]().Where(Eq("id", 3)).UpdateAllSQL(map[string]any{
+		"name": "Ada", "updated_at": Expr("now()"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `UPDATE "users" SET "name" = $1, "updated_at" = now() WHERE "id" = $2`
+	if query != want || !reflect.DeepEqual(args, []any{"Ada", 3}) {
+		t.Fatalf("got %s %#v, want %s %#v", query, args, want, []any{"Ada", 3})
 	}
 }
 

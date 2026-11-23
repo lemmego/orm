@@ -112,6 +112,14 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	return &Tx{db: db, tx: tx}, nil
 }
 
+// WrapTx returns an ORM transaction over an existing database/sql transaction.
+// The caller retains responsibility for committing or rolling it back through
+// the returned handle. This supports units of work that must interoperate with
+// APIs requiring *sql.Tx while still using typed ORM queries.
+func (db *DB) WrapTx(tx *sql.Tx) *Tx {
+	return &Tx{db: db, tx: tx}
+}
+
 type Tx struct {
 	db          *DB
 	tx          *sql.Tx

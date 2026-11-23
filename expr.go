@@ -81,6 +81,31 @@ func Gte(column string, value any) Predicate { return simplePredicate(column, ">
 func Lt(column string, value any) Predicate  { return simplePredicate(column, "<", value) }
 func Lte(column string, value any) Predicate { return simplePredicate(column, "<=", value) }
 
+// ColEq compares two columns. Use it for a join condition rather than binding
+// one column name as a value.
+func ColEq(left, right string) Predicate { return simplePredicate(left, "COLUMN =", right) }
+
+// ColNe compares two columns for inequality.
+func ColNe(left, right string) Predicate { return simplePredicate(left, "COLUMN <>", right) }
+
+func ColGt(left, right string) Predicate  { return simplePredicate(left, "COLUMN >", right) }
+func ColGte(left, right string) Predicate { return simplePredicate(left, "COLUMN >=", right) }
+func ColLt(left, right string) Predicate  { return simplePredicate(left, "COLUMN <", right) }
+func ColLte(left, right string) Predicate { return simplePredicate(left, "COLUMN <=", right) }
+
+// SQLExpr is a trusted SQL expression used as a projection or update value.
+// Keep user input in Args and never interpolate it into SQL.
+type SQLExpr struct {
+	SQL  string
+	Args []any
+}
+
+// Expr constructs a SQL expression with optional bound arguments. Placeholders
+// use ? and are renumbered for the active dialect.
+func Expr(sql string, args ...any) SQLExpr {
+	return SQLExpr{SQL: sql, Args: append([]any(nil), args...)}
+}
+
 func Like(column string, pattern string) Predicate {
 	return simplePredicate(column, "LIKE", pattern)
 }
@@ -208,6 +233,9 @@ func (p Predicate) compile(dialect Dialect, next *int) (string, []any) {
 
 func (p Predicate) compileSimple(dialect Dialect, next *int) (string, []any) {
 	column := quoteColumn(dialect, p.col)
+	if strings.HasPrefix(p.op, "COLUMN ") && len(p.args) == 1 {
+		return column + " " + strings.TrimPrefix(p.op, "COLUMN ") + " " + quoteColumn(dialect, p.args[0].(string)), nil
+	}
 
 	switch p.op {
 	case "IS NULL", "IS NOT NULL":

@@ -76,6 +76,7 @@ Two ways to build the same `Predicate`, producing byte-identical SQL:
 // String constructors — no code generation needed.
 orm.Eq / Ne / Gt / Gte / Lt / Lte / In / NotIn / Like / NotLike
 orm.IsNull / IsNotNull / Between / And / Or / Not / RawPredicate
+orm.ColEq / ColNe / ColGt / ColGte / ColLt / ColLte
 
 // Typed descriptors — compile-time column and value checking.
 var UserFields = struct {
@@ -87,6 +88,24 @@ var UserFields = struct {
 }
 
 db.Model[User]().Where(UserFields.Active.Eq(true))
+```
+
+Column predicates compare columns rather than binding a column name as a
+value. They are useful for joins and correlated conditions:
+
+```go
+db.Model[User]().Join[Post](orm.ColEq("posts.user_id", "users.id"))
+```
+
+For projections and assignments that need a SQL function or alias, `Expr`
+holds a trusted SQL fragment and its bound values separately. Do not
+interpolate request data into its SQL string:
+
+```go
+db.Model[User]().SelectExpr(
+    orm.Expr(`users.id AS user_id`),
+    orm.Expr(`lower(users.email) AS normalized_email`),
+)
 ```
 
 Descriptors are ordinary Go values, so they can be hand-written. `cmd/ormgen`
@@ -293,6 +312,46 @@ self-assignment no-op.
 A generated key is not written back by an upsert: the statement may update an
 existing row rather than insert one, so there is no new key to report.
 
+For a conditional update that must remain atomic under concurrent delivery,
+use `UpsertExprWhere`. Assignments may be trusted SQL expressions with bound
+arguments, and the predicate is evaluated by the database against the existing
+and excluded rows:
+
+```go
+db.Model[Subscription]().UpsertExprWhere(ctx, &subscription,
+    []string{"subscription_id"},
+    map[string]orm.SQLExpr{
+        "status": orm.Expr("EXCLUDED.status"),
+        "event_at": orm.Expr("EXCLUDED.event_at"),
+    },
+    orm.ColGte("excluded.event_at", "subscriptions.event_at"),
+)
+```
+
+Conditional conflict updates are supported by Postgres and SQLite. MySQL's
+duplicate-key syntax has no equivalent conflict `WHERE`, so it returns an
+error. `InsertIgnoreReturning` is available on dialects with `RETURNING` and
+reports inserted versus already-present rows without relying on
+`RowsAffected` semantics.
+
+## Conditional inserts
+
+`CreateIf` builds one `INSERT ... SELECT ... WHERE EXISTS (...)` statement
+from the target entity and a guard query. Use it when authorization and a write
+must be atomic, rather than splitting them into a racy read-then-create check:
+
+```go
+guard := tx.Model[ClientAccountUser]().
+    Join[ClientAccountSite](orm.And(
+        orm.ColEq("client_account_sites.workspace_id", "client_account_users.workspace_id"),
+        orm.ColEq("client_account_sites.account_id", "client_account_users.account_id"),
+    )).
+    Where(orm.Eq("client_account_users.user_id", userID),
+        orm.Eq("client_account_sites.site_id", siteID))
+
+_, err := orm.CreateIf(ctx, tx.Model[ClientIncident](), &incident, guard)
+```
+
 ## Transactions and savepoints
 
 ```go
@@ -313,6 +372,21 @@ err := db.Transaction(ctx, func(tx *orm.Tx) error {
 A transaction is not bound to one entity type, so a single unit of work spans
 as many models as it needs. `AfterCommit` registers callbacks that run only
 once the commit succeeds and cannot roll it back.
+
+When an external API requires `*sql.Tx`, wrap its transaction to keep using
+typed queries. If the transaction becomes tenant-scoped after a tenant row is
+created, bind it at that point:
+
+```go
+sqlTx, err := sqlDB.BeginTx(ctx, nil)
+if err != nil { return err }
+tx := db.WrapTx(sqlTx)
+defer tx.Rollback()
+
+// Create the tenant using the unbound transaction first.
+if err := tx.BindTenant(ctx, workspaceID); err != nil { return err }
+// Tenant-scoped model queries now use the same transaction and binding.
+```
 
 Every registered callback runs, and their errors are joined rather than the
 first one returned — stopping at the first would silently skip work that was
@@ -500,7 +574,7 @@ uninstrumented path costs nothing.
 
 ## Mapping
 
-- Tags: `orm:"column:name"`, `primaryKey`, `autoIncrement`, `-`, and the
+- Tags: `orm:"column:name"`, `primaryKey`, `autoIncrement`, `default`, `-`, and the
   relation forms above. A `db:"..."` tag is honoured as a fallback, with
   modifiers such as `,omitempty` stripped, so CLI-generated models map without
   edits.

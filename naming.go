@@ -28,6 +28,7 @@ type TagInfo struct {
 	Column        string
 	PrimaryKey    bool
 	AutoIncrement bool
+	Default       bool
 	Skip          bool
 
 	SoftDelete     bool
@@ -49,6 +50,7 @@ func ParseTag(value string) TagInfo {
 		Column:          parsed.column,
 		PrimaryKey:      parsed.primaryKey,
 		AutoIncrement:   parsed.autoIncrement,
+		Default:         parsed.defaultValue,
 		Skip:            parsed.skip,
 		SoftDelete:      parsed.softDelete,
 		AutoCreateTime:  parsed.autoCreateTime,

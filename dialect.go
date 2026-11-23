@@ -2,6 +2,7 @@ package orm
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -28,6 +29,10 @@ type Dialect interface {
 	// conflict names the columns that identify an existing row; update names
 	// the columns to overwrite, and being empty means "leave the row alone".
 	UpsertClause(conflict, update []string) (string, error)
+}
+
+type expressionUpserter interface {
+	UpsertExpressionClause(conflict []string, assignments map[string]string, where string) (string, error)
 }
 
 // TenantEnterDialect is the optional interface a dialect implements when the
@@ -112,6 +117,40 @@ func (d postgresDialect) UpsertClause(conflict, update []string) (string, error)
 	return conflictTargetClause(d, conflict, update)
 }
 
+func (d postgresDialect) UpsertExpressionClause(conflict []string, assignments map[string]string, where string) (string, error) {
+	return conflictExpressionClause(d, conflict, assignments, where)
+}
+
+func conflictExpressionClause(d Dialect, conflict []string, assignments map[string]string, where string) (string, error) {
+	if len(conflict) == 0 {
+		return "", fmt.Errorf("orm: %s needs conflict columns for expression upsert", d.Name())
+	}
+	conflictColumns := make([]string, len(conflict))
+	for i, column := range conflict {
+		conflictColumns[i] = d.Quote(column)
+	}
+	columns := make([]string, 0, len(assignments))
+	for column := range assignments {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+	if len(columns) == 0 {
+		if where != "" {
+			return "", fmt.Errorf("orm: %s cannot filter a do-nothing conflict", d.Name())
+		}
+		return conflictTargetClause(d, conflict, nil)
+	}
+	sets := make([]string, len(columns))
+	for i, column := range columns {
+		sets[i] = d.Quote(column) + " = " + assignments[column]
+	}
+	clause := "ON CONFLICT (" + strings.Join(conflictColumns, ", ") + ") DO UPDATE SET " + strings.Join(sets, ", ")
+	if where != "" {
+		clause += " WHERE " + where
+	}
+	return clause, nil
+}
+
 func (postgresDialect) ClassifyError(err error) error {
 	if err == nil {
 		return nil
@@ -166,6 +205,25 @@ func (d mysqlDialect) UpsertClause(conflict, update []string) (string, error) {
 	return "ON DUPLICATE KEY UPDATE " + strings.Join(assignments, ", "), nil
 }
 
+func (d mysqlDialect) UpsertExpressionClause(_ []string, assignments map[string]string, where string) (string, error) {
+	if where != "" {
+		return "", fmt.Errorf("orm: mysql does not support a conditional conflict update")
+	}
+	columns := make([]string, 0, len(assignments))
+	for column := range assignments {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+	if len(columns) == 0 {
+		return "", fmt.Errorf("orm: mysql expression upsert needs at least one assignment")
+	}
+	sets := make([]string, len(columns))
+	for i, column := range columns {
+		sets[i] = d.Quote(column) + " = " + assignments[column]
+	}
+	return "ON DUPLICATE KEY UPDATE " + strings.Join(sets, ", "), nil
+}
+
 func (mysqlDialect) ClassifyError(err error) error {
 	if err == nil {
 		return nil
@@ -194,6 +252,10 @@ func (sqliteDialect) SupportsReturning() bool  { return false }
 
 func (d sqliteDialect) UpsertClause(conflict, update []string) (string, error) {
 	return conflictTargetClause(d, conflict, update)
+}
+
+func (d sqliteDialect) UpsertExpressionClause(conflict []string, assignments map[string]string, where string) (string, error) {
+	return conflictExpressionClause(d, conflict, assignments, where)
 }
 
 func (sqliteDialect) ClassifyError(err error) error {

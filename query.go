@@ -32,16 +32,17 @@ type Query[T any] struct {
 	dialect  Dialect
 	table    string
 
-	columns  []string
-	preds    []Predicate
-	joins    []joinClause
-	groups   []string
-	having   []Predicate
-	orders   []Ordering
-	withs    []string
-	limit    int
-	offset   int
-	distinct bool
+	columns     []string
+	selectExprs []SQLExpr
+	preds       []Predicate
+	joins       []joinClause
+	groups      []string
+	having      []Predicate
+	orders      []Ordering
+	withs       []string
+	limit       int
+	offset      int
+	distinct    bool
 
 	// tenantColumn and tenantValue are resolved once from T and the handle's
 	// binding, then carried through clone() and As[R] — so a reprojection or
@@ -108,6 +109,7 @@ func newQueryForTable[T any](db *DB, exec executor, table string) *Query[T] {
 func (q *Query[T]) clone() *Query[T] {
 	next := *q
 	next.columns = append([]string(nil), q.columns...)
+	next.selectExprs = append([]SQLExpr(nil), q.selectExprs...)
 	next.preds = append([]Predicate(nil), q.preds...)
 	next.joins = append([]joinClause(nil), q.joins...)
 	next.groups = append([]string(nil), q.groups...)
@@ -139,6 +141,14 @@ func (q *Query[T]) Where(predicates ...Predicate) *Query[T] {
 func (q *Query[T]) Select(columns ...string) *Query[T] {
 	next := q.clone()
 	next.columns = append(next.columns, columns...)
+	return next
+}
+
+// SelectExpr appends trusted SQL expressions to the projection. Values must
+// be bound as expression arguments rather than interpolated into SQL.
+func (q *Query[T]) SelectExpr(expressions ...SQLExpr) *Query[T] {
+	next := q.clone()
+	next.selectExprs = append(next.selectExprs, expressions...)
 	return next
 }
 
@@ -236,6 +246,8 @@ func (q *Query[T]) As[R any]() *Query[R] {
 		executor:         q.executor,
 		dialect:          q.dialect,
 		table:            q.table,
+		columns:          append([]string(nil), q.columns...),
+		selectExprs:      append([]SQLExpr(nil), q.selectExprs...),
 		preds:            append([]Predicate(nil), q.preds...),
 		joins:            append([]joinClause(nil), q.joins...),
 		groups:           append([]string(nil), q.groups...),
@@ -333,6 +345,11 @@ func (q *Query[T]) SQL() (string, []any) {
 // so that a single placeholder counter numbers every argument correctly under
 // $N dialects.
 func (q *Query[T]) buildSelect(projection string) (string, []any, error) {
+	next := 0
+	return q.buildSelectAt(projection, &next)
+}
+
+func (q *Query[T]) buildSelectAt(projection string, next *int) (string, []any, error) {
 	if q.err != nil {
 		return "", nil, q.err
 	}
@@ -342,7 +359,6 @@ func (q *Query[T]) buildSelect(projection string) (string, []any, error) {
 
 	var builder strings.Builder
 	args := make([]any, 0, 8)
-	next := 0
 
 	builder.WriteString("SELECT ")
 	if q.distinct {
@@ -351,24 +367,25 @@ func (q *Query[T]) buildSelect(projection string) (string, []any, error) {
 	if projection != "" {
 		builder.WriteString(projection)
 	} else {
-		list, err := q.projection()
+		list, projectionArgs, err := q.projection(next)
 		if err != nil {
 			return "", nil, err
 		}
 		builder.WriteString(list)
+		args = append(args, projectionArgs...)
 	}
 	builder.WriteString(" FROM " + q.dialect.Quote(q.table))
 
 	for _, join := range q.joins {
 		builder.WriteString(" " + join.kind + " JOIN " + q.dialect.Quote(join.table))
 		if !join.on.IsZero() {
-			condition, conditionArgs := join.on.compile(q.dialect, &next)
+			condition, conditionArgs := join.on.compile(q.dialect, next)
 			builder.WriteString(" ON " + condition)
 			args = append(args, conditionArgs...)
 		}
 	}
 
-	if clause, clauseArgs := compileConjunction(q.scopedPredicates(), q.dialect, &next); clause != "" {
+	if clause, clauseArgs := compileConjunction(q.scopedPredicates(), q.dialect, next); clause != "" {
 		builder.WriteString(" WHERE " + clause)
 		args = append(args, clauseArgs...)
 	}
@@ -381,7 +398,7 @@ func (q *Query[T]) buildSelect(projection string) (string, []any, error) {
 		builder.WriteString(" GROUP BY " + strings.Join(grouped, ", "))
 	}
 
-	if clause, clauseArgs := compileConjunction(q.having, q.dialect, &next); clause != "" {
+	if clause, clauseArgs := compileConjunction(q.having, q.dialect, next); clause != "" {
 		builder.WriteString(" HAVING " + clause)
 		args = append(args, clauseArgs...)
 	}
@@ -399,11 +416,11 @@ func (q *Query[T]) buildSelect(projection string) (string, []any, error) {
 	}
 
 	if q.limit > 0 {
-		builder.WriteString(" LIMIT " + nextPlaceholder(q.dialect, &next))
+		builder.WriteString(" LIMIT " + nextPlaceholder(q.dialect, next))
 		args = append(args, q.limit)
 	}
 	if q.offset > 0 {
-		builder.WriteString(" OFFSET " + nextPlaceholder(q.dialect, &next))
+		builder.WriteString(" OFFSET " + nextPlaceholder(q.dialect, next))
 		args = append(args, q.offset)
 	}
 	return builder.String(), args, nil
@@ -415,18 +432,24 @@ func (q *Query[T]) buildSelect(projection string) (string, []any, error) {
 // that rejects unknown columns: any column present in the table but absent
 // from the struct broke every read. Naming the columns removes the failure
 // mode entirely.
-func (q *Query[T]) projection() (string, error) {
-	if len(q.columns) > 0 {
-		quoted := make([]string, len(q.columns))
+func (q *Query[T]) projection(next *int) (string, []any, error) {
+	if len(q.columns) > 0 || len(q.selectExprs) > 0 {
+		quoted := make([]string, 0, len(q.columns)+len(q.selectExprs))
+		args := make([]any, 0)
 		for i, column := range q.columns {
-			quoted[i] = quoteColumn(q.dialect, column)
+			_ = i
+			quoted = append(quoted, quoteColumn(q.dialect, column))
 		}
-		return strings.Join(quoted, ", "), nil
+		for _, expression := range q.selectExprs {
+			quoted = append(quoted, expandPlaceholders(q.dialect, expression.SQL, next))
+			args = append(args, expression.Args...)
+		}
+		return strings.Join(quoted, ", "), args, nil
 	}
 
 	info, err := modelInfoFor(reflect.TypeFor[T]())
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	qualify := len(q.joins) > 0
 	quoted := make([]string, len(info.Fields))
@@ -437,7 +460,7 @@ func (q *Query[T]) projection() (string, error) {
 		}
 		quoted[i] = q.dialect.Quote(field.Column)
 	}
-	return strings.Join(quoted, ", "), nil
+	return strings.Join(quoted, ", "), nil, nil
 }
 
 func compileConjunction(predicates []Predicate, dialect Dialect, next *int) (string, []any) {
@@ -723,7 +746,7 @@ func (q *Query[T]) insert(ctx context.Context, query string, args []any, info *M
 // generatedKey returns the settable primary-key field when it is an
 // auto-increment column still holding its zero value.
 func generatedKey[T any](info *ModelInfo, entity *T) reflect.Value {
-	if info.PrimaryKey == nil || !info.PrimaryKey.AutoIncrement {
+	if info.PrimaryKey == nil || (!info.PrimaryKey.AutoIncrement && !info.PrimaryKey.Default) {
 		return reflect.Value{}
 	}
 	field, err := fieldByIndex(reflect.ValueOf(entity).Elem(), info.PrimaryKey.Index)
@@ -802,17 +825,27 @@ func (q *Query[T]) stampTenant(info *ModelInfo, value reflect.Value) error {
 }
 
 func (q *Query[T]) InsertSQL(entity *T) (string, []any, error) {
-	info, err := modelInfoFor(reflect.TypeFor[T]())
+	info, columns, placeholders, args, err := q.insertParts(entity)
 	if err != nil {
 		return "", nil, err
 	}
+	query := "INSERT INTO " + q.dialect.Quote(info.Table) +
+		" (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ")"
+	return query, args, nil
+}
+
+func (q *Query[T]) insertParts(entity *T) (*ModelInfo, []string, []string, []any, error) {
+	info, err := modelInfoFor(reflect.TypeFor[T]())
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
 	value := reflect.ValueOf(entity)
-	if value.IsNil() {
-		return "", nil, fmt.Errorf("orm: cannot insert a nil %s", info.Type)
+	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() {
+		return nil, nil, nil, nil, fmt.Errorf("orm: cannot insert a nil %s", info.Type)
 	}
 	value = value.Elem()
 	if err := q.stampTenant(info, value); err != nil {
-		return "", nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	columns := make([]string, 0, len(info.Fields))
@@ -822,9 +855,9 @@ func (q *Query[T]) InsertSQL(entity *T) (string, []any, error) {
 	for _, field := range info.Fields {
 		fieldValue, err := fieldByIndex(value, field.Index)
 		if err != nil {
-			return "", nil, err
+			return nil, nil, nil, nil, err
 		}
-		if field.AutoIncrement && fieldValue.IsZero() {
+		if (field.AutoIncrement || field.Default) && fieldValue.IsZero() {
 			continue
 		}
 		columns = append(columns, q.dialect.Quote(field.Column))
@@ -832,12 +865,67 @@ func (q *Query[T]) InsertSQL(entity *T) (string, []any, error) {
 		args = append(args, fieldValue.Interface())
 	}
 	if len(columns) == 0 {
-		return "", nil, fmt.Errorf("orm: cannot insert %s without fields", info.Type)
+		return nil, nil, nil, nil, fmt.Errorf("orm: cannot insert %s without fields", info.Type)
 	}
-	query := "INSERT INTO " + q.dialect.Quote(info.Table) +
-		" (" + strings.Join(columns, ", ") + ") VALUES (" +
-		strings.Join(placeholders, ", ") + ")"
-	return query, args, nil
+	return info, columns, placeholders, args, nil
+}
+
+// CreateIf inserts entity only when guard matches at statement time. Both
+// queries must use the same transaction. This keeps authorization predicates
+// and the insert atomic without embedding the statement in a raw SQL string.
+func CreateIf[T, G any](ctx context.Context, target *Query[T], entity *T, guard *Query[G]) (sql.Result, error) {
+	if target == nil || guard == nil {
+		return nil, fmt.Errorf("orm: CreateIf needs both target and guard queries")
+	}
+	if executorIdentity(target.executor) == 0 || executorIdentity(target.executor) != executorIdentity(guard.executor) {
+		return nil, fmt.Errorf("orm: CreateIf target and guard must share the same database transaction")
+	}
+	if err := runBeforeCreate(ctx, entity); err != nil {
+		return nil, err
+	}
+	info, err := modelInfoFor(reflect.TypeFor[T]())
+	if err != nil {
+		return nil, err
+	}
+	if err := applyCreateTimestamps(info, entity); err != nil {
+		return nil, err
+	}
+	_, columns, placeholders, args, err := target.insertParts(entity)
+	if err != nil {
+		return nil, err
+	}
+	next := len(args)
+	guardSQL, guardArgs, err := guard.buildSelectAt("1", &next)
+	if err != nil {
+		return nil, err
+	}
+	query := "INSERT INTO " + target.dialect.Quote(info.Table) +
+		" (" + strings.Join(columns, ", ") + ") SELECT " + strings.Join(placeholders, ", ") +
+		" WHERE EXISTS (" + guardSQL + ")"
+	args = append(args, guardArgs...)
+	result, err := target.insert(ctx, query, args, info, entity)
+	if err != nil {
+		return nil, err
+	}
+	if err := runAfterCreate(ctx, entity); err != nil {
+		return nil, err
+	}
+	target.observe(ctx, ChangeCreate, entity)
+	return result, nil
+}
+
+func executorIdentity(exec executor) uintptr {
+	switch wrapped := exec.(type) {
+	case tenantExecutor:
+		return executorIdentity(wrapped.executor)
+	case *loggingExecutor:
+		return executorIdentity(wrapped.inner)
+	}
+	value := reflect.ValueOf(exec)
+	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() {
+		return 0
+	}
+	return value.Pointer()
 }
 
 // Upsert inserts the entity, or updates the named columns when a row with the
@@ -865,6 +953,71 @@ func (q *Query[T]) Upsert(ctx context.Context, entity *T, conflict []string, upd
 	return q.upsert(ctx, entity, info, conflict, update)
 }
 
+// UpsertExpr inserts or updates using trusted SQL expressions for the conflict
+// assignments. Expressions keep their bind values separate and placeholders
+// are numbered after the inserted values.
+func (q *Query[T]) UpsertExpr(ctx context.Context, entity *T, conflict []string, assignments map[string]SQLExpr) (sql.Result, error) {
+	return q.UpsertExprWhere(ctx, entity, conflict, assignments, Predicate{})
+}
+
+// UpsertExprWhere adds a predicate to the conflict-update branch. The
+// predicate is evaluated by the database against the conflicting row and the
+// proposed excluded row, preserving monotonic/idempotent writes under races.
+func (q *Query[T]) UpsertExprWhere(ctx context.Context, entity *T, conflict []string, assignments map[string]SQLExpr, where Predicate) (sql.Result, error) {
+	if len(conflict) == 0 {
+		return nil, fmt.Errorf("orm: UpsertExprWhere needs at least one conflict column")
+	}
+	info, err := modelInfoFor(reflect.TypeFor[T]())
+	if err != nil {
+		return nil, err
+	}
+	if err := runBeforeCreate(ctx, entity); err != nil {
+		return nil, err
+	}
+	if err := applyCreateTimestamps(info, entity); err != nil {
+		return nil, err
+	}
+	query, args, err := q.InsertSQL(entity)
+	if err != nil {
+		return nil, err
+	}
+	upserter, ok := q.dialect.(expressionUpserter)
+	if !ok {
+		return nil, fmt.Errorf("orm: %s does not support expression upserts", q.dialect.Name())
+	}
+	next := len(args)
+	compiled := make(map[string]string, len(assignments))
+	columns := make([]string, 0, len(assignments))
+	for column := range assignments {
+		columns = append(columns, column)
+	}
+	sort.Strings(columns)
+	for _, column := range columns {
+		expression := assignments[column]
+		compiled[column] = expandPlaceholders(q.dialect, expression.SQL, &next)
+		args = append(args, expression.Args...)
+	}
+	whereSQL := ""
+	if !where.IsZero() {
+		var whereArgs []any
+		whereSQL, whereArgs = where.compile(q.dialect, &next)
+		args = append(args, whereArgs...)
+	}
+	clause, err := upserter.UpsertExpressionClause(conflict, compiled, whereSQL)
+	if err != nil {
+		return nil, err
+	}
+	result, err := q.executor.ExecContext(ctx, query+" "+clause, args...)
+	if err != nil {
+		return nil, q.dialect.ClassifyError(err)
+	}
+	if err := runAfterCreate(ctx, entity); err != nil {
+		return nil, err
+	}
+	q.observe(ctx, ChangeCreate, entity)
+	return result, nil
+}
+
 // InsertIgnore inserts the entity, doing nothing if it already exists.
 func (q *Query[T]) InsertIgnore(ctx context.Context, entity *T, conflict ...string) (sql.Result, error) {
 	if len(conflict) == 0 {
@@ -875,6 +1028,56 @@ func (q *Query[T]) InsertIgnore(ctx context.Context, entity *T, conflict ...stri
 		return nil, err
 	}
 	return q.upsert(ctx, entity, info, conflict, nil)
+}
+
+// InsertIgnoreReturning returns inserted=false when the conflict target already
+// existed. It uses RETURNING rather than RowsAffected because callers such as
+// one-time token redemption need an explicit inserted/no-row answer.
+func (q *Query[T]) InsertIgnoreReturning(ctx context.Context, entity *T, conflict ...string) (bool, error) {
+	if len(conflict) == 0 {
+		return false, fmt.Errorf("orm: InsertIgnoreReturning needs at least one conflict column")
+	}
+	if !q.dialect.SupportsReturning() {
+		return false, fmt.Errorf("orm: %s does not support InsertIgnoreReturning", q.dialect.Name())
+	}
+	info, err := modelInfoFor(reflect.TypeFor[T]())
+	if err != nil {
+		return false, err
+	}
+	if err := runBeforeCreate(ctx, entity); err != nil {
+		return false, err
+	}
+	if err := applyCreateTimestamps(info, entity); err != nil {
+		return false, err
+	}
+	query, args, err := q.InsertSQL(entity)
+	if err != nil {
+		return false, err
+	}
+	clause, err := q.dialect.UpsertClause(conflict, nil)
+	if err != nil {
+		return false, err
+	}
+	rows, err := q.executor.QueryContext(ctx, query+" "+clause+" RETURNING "+q.dialect.Quote(conflict[0]), args...)
+	if err != nil {
+		return false, q.dialect.ClassifyError(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return false, q.dialect.ClassifyError(err)
+		}
+		return false, nil
+	}
+	var returned any
+	if err := rows.Scan(&returned); err != nil {
+		return false, q.dialect.ClassifyError(err)
+	}
+	if err := runAfterCreate(ctx, entity); err != nil {
+		return false, err
+	}
+	q.observe(ctx, ChangeCreate, entity)
+	return true, nil
 }
 
 func (q *Query[T]) upsert(ctx context.Context, entity *T, info *ModelInfo, conflict, update []string) (sql.Result, error) {
@@ -1190,14 +1393,28 @@ func (q *Query[T]) DeleteSQL(entity *T) (string, []any, error) {
 // and ErrUnsafeMutation makes it an explicit opt-in rather than a silent
 // table rewrite.
 func (q *Query[T]) UpdateAll(ctx context.Context, values map[string]any) (sql.Result, error) {
+	query, args, err := q.UpdateAllSQL(values)
+	if err != nil {
+		return nil, err
+	}
+	result, err := q.executor.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, q.dialect.ClassifyError(err)
+	}
+	return result, nil
+}
+
+// UpdateAllSQL renders UpdateAll without executing it. It refuses an unfiltered
+// mutation for the same reason UpdateAll does.
+func (q *Query[T]) UpdateAllSQL(values map[string]any) (string, []any, error) {
 	if q.err != nil {
-		return nil, q.err
+		return "", nil, q.err
 	}
 	if len(q.preds) == 0 {
-		return nil, ErrUnsafeMutation
+		return "", nil, ErrUnsafeMutation
 	}
 	if len(values) == 0 {
-		return nil, fmt.Errorf("orm: UpdateAll requires at least one column")
+		return "", nil, fmt.Errorf("orm: UpdateAll requires at least one column")
 	}
 
 	columns := make([]string, 0, len(values))
@@ -1210,8 +1427,15 @@ func (q *Query[T]) UpdateAll(ctx context.Context, values map[string]any) (sql.Re
 	sets := make([]string, len(columns))
 	args := make([]any, 0, len(columns))
 	for i, column := range columns {
-		sets[i] = quoteColumn(q.dialect, column) + " = " + nextPlaceholder(q.dialect, &next)
-		args = append(args, values[column])
+		sets[i] = quoteColumn(q.dialect, column) + " = "
+		switch value := values[column].(type) {
+		case SQLExpr:
+			sets[i] += expandPlaceholders(q.dialect, value.SQL, &next)
+			args = append(args, value.Args...)
+		default:
+			sets[i] += nextPlaceholder(q.dialect, &next)
+			args = append(args, value)
+		}
 	}
 
 	query := "UPDATE " + q.dialect.Quote(q.table) + " SET " + strings.Join(sets, ", ")
@@ -1219,11 +1443,7 @@ func (q *Query[T]) UpdateAll(ctx context.Context, values map[string]any) (sql.Re
 	query += " WHERE " + clause
 	args = append(args, clauseArgs...)
 
-	result, err := q.executor.ExecContext(ctx, query, args...)
-	if err != nil {
-		return nil, q.dialect.ClassifyError(err)
-	}
-	return result, nil
+	return query, args, nil
 }
 
 // DeleteAll removes every matching row. Like UpdateAll it refuses to run
