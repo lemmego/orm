@@ -76,7 +76,7 @@ func (db *DB) Close() error { return db.db.Close() }
 // It is deliberately not bound to one entity type, so a single transaction can
 // span as many models as the unit of work needs.
 func (db *DB) Transaction(ctx context.Context, fn func(*Tx) error) error {
-	tx, err := db.db.BeginTx(ctx, nil)
+	tx, err := db.beginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -105,11 +105,25 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 }
 
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	tx, err := db.db.BeginTx(ctx, opts)
+	tx, err := db.beginTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 	return &Tx{db: db, tx: tx}, nil
+}
+
+// beginTx opens a transaction, dropping any option the dialect cannot
+// express. Every path that starts a transaction goes through here, so a
+// capability is honoured once rather than at each call site.
+func (db *DB) beginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	if opts != nil && opts.ReadOnly && !SupportsReadOnlyTransactions(db.dialect) {
+		// Copied, never mutated: the caller may reuse the struct, and
+		// tenancy hands the same intent in on every request.
+		downgraded := *opts
+		downgraded.ReadOnly = false
+		opts = &downgraded
+	}
+	return db.db.BeginTx(ctx, opts)
 }
 
 // WrapTx returns an ORM transaction over an existing database/sql transaction.

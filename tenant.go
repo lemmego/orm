@@ -196,7 +196,7 @@ func (db *DB) TenantTxOptions(ctx context.Context, value any, opts *sql.TxOption
 		return fmt.Errorf("%w: TenantTx needs a tenant", ErrNoTenant)
 	}
 
-	tx, err := db.db.BeginTx(ctx, opts)
+	tx, err := db.beginTx(ctx, opts)
 	if err != nil {
 		return err
 	}

@@ -64,6 +64,38 @@ type TenantEnterDialect interface {
 	TenantEnterSQL() string
 }
 
+// NoReadOnlyTransactions is the optional interface a dialect implements when
+// the database cannot open a read-only transaction.
+//
+// # Why this is opt-OUT where TenantEnterDialect is opt-in
+//
+// The inverse shape, for the inverse reason. Every dialect this package ships
+// can open a read-only transaction, so a flag on Dialect would default a
+// third-party dialect to "supported" — the dangerous direction, and a
+// breaking change besides. A dialect that cannot do it says so by
+// implementing this, and its absence is the common case rather than a gap.
+//
+// # Why the option is dropped rather than the call refused
+//
+// ReadOnly is a safety net, not correctness. TenantTxOptions recommends it
+// "for a request that only reads: it costs nothing and turns 'a read path
+// wrote something' into a database error". Refusing would turn every read
+// request on such a backend into a 500, which trades a lost assertion for an
+// outage. So the flag is dropped and the loss is reported once by whatever
+// chose the dialect, not once per request.
+//
+// Measured against libSQL's sqld, which answers
+// "read only transactions are not supported" from BeginTx.
+type NoReadOnlyTransactions interface {
+	ReadOnlyTransactionsUnsupported()
+}
+
+// SupportsReadOnlyTransactions reports whether a dialect can open one.
+func SupportsReadOnlyTransactions(dialect Dialect) bool {
+	_, cannot := dialect.(NoReadOnlyTransactions)
+	return !cannot
+}
+
 // conflictTargetClause renders the "ON CONFLICT (a, b)" target shared by the
 // dialects that follow the SQL-standard spelling.
 func conflictTargetClause(dialect Dialect, conflict, update []string) (string, error) {
@@ -326,6 +358,21 @@ func columnsFromQuoted(message string) []string {
 	return nil
 }
 
+// libsqlDialect is SQLite's syntax with SQLite's capabilities minus one.
+//
+// libSQL is a fork of SQLite, so every statement this package generates for
+// SQLite is valid; what differs is that its Go driver refuses a read-only
+// transaction. Embedding rather than aliasing keeps that difference visible:
+// an alias would make every switch on the dialect silently treat it as
+// SQLite, which is right for SQL and wrong for capability.
+type libsqlDialect struct{ sqliteDialect }
+
+func (libsqlDialect) Name() string                     { return "libsql" }
+func (libsqlDialect) ReadOnlyTransactionsUnsupported() {}
+
+var _ NoReadOnlyTransactions = libsqlDialect{}
+
 func Postgres() Dialect { return postgresDialect{} }
 func MySQL() Dialect    { return mysqlDialect{} }
 func SQLite() Dialect   { return sqliteDialect{} }
+func LibSQL() Dialect   { return libsqlDialect{} }
